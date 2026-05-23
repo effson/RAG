@@ -1,61 +1,55 @@
 import os
-import sys
-from os.path import splitext
 
-from app.core.logger import logger
+from pathlib import Path
+from app.core.logger import logger, node_log
 from app.import_process.agent.state import ImportGraphState, create_default_state
-from app.utils.format_utils import format_state
 from app.utils.task_utils import add_running_task, add_done_task
 
+@node_log("node_entry")
 def node_entry(state: ImportGraphState) -> ImportGraphState:
     """
-    LangGraph知识库导入工作流 - 入口节点
-    核心职责：初始化参数校验 | 自动判断文件类型(PDF/MD) | 设置解析开关 | 提取业务标识
-    入参：ImportGraphState - 必须包含 local_file_path(文件路径)、task_id(任务ID)
-    出参：ImportGraphState - 新增/更新 is_pdf_read_enabled/is_md_read_enabled/pdf_path/md_path/file_title
-    执行链路：__start__ → 本节点 → route_after_entry(条件路由) → 对应解析节点/流程终止
+    节点: 入口节点 (node_entry)
+    为什么叫这个名字: 作为图的 Entry Point，负责接收外部输入并决定流程走向。
+    未来要实现:
+        1. 进行任务状态记录,开始和结束列表记录
+        2. 根据state中 local_file_path属性判断数据类型进而修改
+           相关参数, is_md_read_enabled 或者 is_pdf_read_enabled
+                    md_path 或者 pdf_path
+        3. 不可解析结果类型不可用,直接输出对应警告日志! 逻辑路由节点会自动处理
+        4. 获取file_tile标识,用于后期识别pdf对应的主体(item_name)进行兜底
     """
 
-    # 动态获取函数名避免硬编码
-    func_name = sys._getframe().f_code.co_name
+    # 1. 任务状态记录处理
+    add_running_task(state['task_id'],'node_entry')
 
-    # 节点启动日志，打印当前工作流状态
-    logger.debug(f"【{func_name}】节点启动，\n当前工作流状态：{format_state(state)}")
-
-    # 开始：记录节点运行状态
-    add_running_task(state["task_id"], func_name)
-
-    # 1. 核心参数提取与非空校验
-    document_path = state.get("local_file_path", "")
-    if not document_path:
-        logger.error(f"【{func_name}】核心参数缺失：task_id = {state["task_id"]}, 工作流状态中未配置local_file_path，文件路径为空")
-        add_done_task(state["task_id"], func_name)
+    # 2. 判断文件类型
+    local_file_path = state['local_file_path']
+    if not local_file_path:
+        logger.warning(f"没有输入文件地址,无法处理,直接跳转到结束节点!")
+        add_done_task(state['task_id'], 'node_entry')
         return state
 
-    # 2. 根据文件后缀判断类型，设置对应解析开关
-    if document_path.endswith(".pdf"):
-        logger.info(f"【{func_name}】文件类型校验通过：task_id = {state["task_id"]}, {document_path} → PDF格式，开启PDF解析流程")
-        state["is_pdf_read_enabled"] = True
-        state["pdf_path"] = document_path
-    elif document_path.endswith(".md"):
-        logger.info(f"【{func_name}】文件类型校验通过：task_id = {state["task_id"]}, {document_path} → MD格式，开启MD解析流程")
-        state["is_md_read_enabled"] = True
-        state["md_path"] = document_path
+    if local_file_path.endswith(".md"):
+        state['is_md_read_enabled'] = True
+        state['md_path'] = local_file_path
+    elif local_file_path.endswith(".pdf"):
+        state['is_pdf_read_enabled'] = True
+        state['pdf_path'] = local_file_path
     else:
-        logger.warning(f"【{func_name}】文件类型校验失败：task_id = {state["task_id"]}, {document_path} → 不支持的格式，仅支持.pdf/.md")
+        logger.warning(f"虽然输出loclal_file_path,但无法识别文件类型,请检查输入文件类型是否正确,目前只支持md和pdf文件! {local_file_path}")
+        add_done_task(state['task_id'], 'node_entry')
+        return state
 
-    # 3. 提取文件无后缀纯名称，作为全局业务标识
-    file_name = os.path.basename(document_path)
-    state["file_title"] = splitext(file_name)[0]
-    logger.info(f"【{func_name}】文件业务标识提取完成：task_id = {state["task_id"]},  file_title = {state['file_title']}")
-    logger.info(f"【{func_name}】文件业务标识提取完成：res = {state}")
+    # 3. 获取文件标识
+    # 基于os.path处理
+    file_title_os = os.path.basename(local_file_path).split(".")[0]
+    # 基于pathlib处理
+    file_title = Path(local_file_path).stem # 文件名 .name  文件夹名 .parent   文件后缀 .suffix
+    state['file_title']= file_title
+    logger.info(f"task_id {state['task_id']} 的 node_entry 任务完成!")
+    logger.info(f"task_id {state['task_id']} 的res 为{state}")
 
-    # 结束：记录节点运行状态
-    add_done_task(state["task_id"], func_name)
-
-    # 节点完成日志，打印当前工作流状态
-    logger.debug(f"【{func_name}】节点执行完成，task_id = {state["task_id"]}, \n更新后工作流状态：{format_state(state)}")
-
+    add_done_task(state['task_id'], 'node_entry')
     return state
 
 if __name__ == '__main__':
