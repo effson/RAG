@@ -7,7 +7,7 @@ from app.core.logger import logger  # 复用项目全局logger
 _GLOBAL_REQUEST_TIMES: Deque[float] = deque()
 
 def apply_api_rate_limit(
-        max_requests: int = 500,
+        max_requests: int = 200,
         window_seconds: int = 60
 ) -> None:
     """
