@@ -70,17 +70,16 @@ def generate_embeddings(texts):
 
         # 初始化稀疏向量处理结果，解析为字典格式（适配序列化/存储）
         processed_sparse = []
-        # # 把模型输出的 CSR 稀疏矩阵 ，按“每条文本一行”拆成 {特征索引: 权重} 字典
-        # # - indices ：非零元素的“列号（特征ID）”
-        # # - data ：对应列号的权重值
-        # # - indptr ：每一行在 indices/data 里的起止位置指针
-        # # 数据示例:
-        # # indices = [3, 8, 20, 1, 9]
-        # # data    = [0.7, 0.2, 0.1, 0.6, 0.4]  -> milvus -> 稠密向量 [1024] 稀疏向量 : {index:值,index:值}
-        # # indptr  = [0, 3, 5]
-        # # 获取对应的数据
-        # # - 第0条文本用 0:3 => indices=[3,8,20] , data=[0.7,0.2,0.1]
-        # # - 第1条文本用 3:5 => indices=[1,9] , data=[0.6,0.4]
+        """
+        把模型输出的 CSR 稀疏矩阵 ，按“每条文本一行”拆成 {特征索引: 权重} 字典
+        - indices ：非零元素的“列号（特征ID）”  - data ：对应列号的权重值  - indptr ：每一行在 indices/data 里的起止位置指针
+        数据示例:
+        indices = [3, 8, 20, 1, 9]   data = [0.7, 0.2, 0.1, 0.6, 0.4]  -> milvus -> 稠密向量 [1024] 稀疏向量 : {index:值,index:值}
+        indptr  = [0, 3, 5]
+        获取对应的数据
+        - 第0条文本用 0:3 => indices=[3,8,20] , data=[0.7,0.2,0.1]
+         第1条文本用 3:5 => indices=[1,9] , data=[0.6,0.4]
+        """
         for i in range(len(texts)):
             # 提取第i个文本的稀疏向量索引：np.int64 → Python int（满足字典key可哈希要求）
             sparse_indices = embeddings["sparse"].indices[
