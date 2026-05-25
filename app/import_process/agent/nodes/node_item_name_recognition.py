@@ -1,7 +1,7 @@
 # 导入基础库：系统、路径、类型注解（类型注解提升代码可读性和可维护性）
 import os
 import sys
-
+from pymilvus.client.types import ConsistencyLevel
 from typing import List, Dict, Any, Tuple
 from app.conf.milvus_config import milvus_config
 from langchain_core.output_parsers import StrOutputParser
@@ -226,12 +226,6 @@ def test_node_item_name_recognition():
     商品名称识别节点本地测试方法
     功能：模拟LangGraph流程输入，独立测试node_item_name_recognition节点全链路逻辑
     适用场景：本地开发、调试、单节点功能验证，无需启动整个LangGraph流程
-    测试前准备：
-        1. 确保项目环境变量配置完成（MILVUS_URL/ITEM_NAME_COLLECTION等）
-        2. 确保大模型、Milvus、BGE-M3服务均可正常访问
-        3. 确保prompt模板（item_name_recognition/product_recognition_system）已存在
-    使用方法：
-        直接运行该函数：if __name__ == "__main__": test_node_item_name_recognition()
     """
     logger.info("=== 开始执行商品名称识别节点本地测试 ===")
     try:
@@ -278,7 +272,8 @@ def test_node_item_name_recognition():
             res = milvus_client.query(
                 collection_name=collection_name,
                 filter=f'item_name=="{safe_name}"',
-                output_fields=["file_title", "item_name"]
+                output_fields=["file_title", "item_name"],
+                consistency_level=0
             )
             logger.info(f"Milvus中检索到的数据：{res}")
 
