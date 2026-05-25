@@ -232,7 +232,7 @@ def node_document_split(state: ImportGraphState) -> ImportGraphState:
     # 4. 数据备份处理,chunk.json  step_5_backup_data
     step_4_backup_data(chunks, state['md_path'])
 
-    # 5. 修改state属性 chunks -&gt; chunk切块列表即可
+    # 5. 修改state属性 chunks -> chunk切块列表即可
     state["chunks"] = chunks
     # 将当前节点加入运行中任务，更新全局任务状态
     add_done_task(state['task_id'],"node_document_split")

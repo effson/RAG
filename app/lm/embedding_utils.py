@@ -7,8 +7,8 @@ _bge_m3_ef = None
 
 def get_bge_m3_ef():
     """
-    获取BGE-M3模型单例对象，自动加载环境变量配置
-    :return: 初始化完成的BGEM3EmbeddingFunction实例
+    获取BGE-M3 模型单例对象，自动加载环境变量配置
+    :return: 初始化完成的 BGEM3EmbeddingFunction 实例
     """
     global _bge_m3_ef
     # 单例模式：已初始化则直接返回，避免重复加载模型
@@ -34,7 +34,7 @@ def get_bge_m3_ef():
     )
 
     try:
-        # 初始化BGE-M3模型，开启原生L2归一化（适配Milvus IP内积检索）
+       # 初始化BGE-M3模型，开启原生L2归一化（适配Milvus IP内积检索）
         _bge_m3_ef = BGEM3EmbeddingFunction(
             model_name=model_name,
             device=device,
@@ -50,7 +50,7 @@ def get_bge_m3_ef():
 
 def generate_embeddings(texts):
     """
-    为文本列表生成稠密+稀疏混合向量嵌入（模型原生L2归一化）
+    为文本列表生成稠密 + 稀疏混合向量嵌入（模型原生 L2 归一化）
     :param texts: 要生成嵌入的文本列表，单文本也需封装为列表
     :return: 字典格式的向量结果，key为dense/sparse，对应嵌套列表/字典列表
     :raise: 向量生成过程中的异常，由调用方捕获处理
@@ -70,6 +70,17 @@ def generate_embeddings(texts):
 
         # 初始化稀疏向量处理结果，解析为字典格式（适配序列化/存储）
         processed_sparse = []
+        # # 把模型输出的 CSR 稀疏矩阵 ，按“每条文本一行”拆成 {特征索引: 权重} 字典
+        # # - indices ：非零元素的“列号（特征ID）”
+        # # - data ：对应列号的权重值
+        # # - indptr ：每一行在 indices/data 里的起止位置指针
+        # # 数据示例:
+        # # indices = [3, 8, 20, 1, 9]
+        # # data    = [0.7, 0.2, 0.1, 0.6, 0.4]  -> milvus -> 稠密向量 [1024] 稀疏向量 : {index:值,index:值}
+        # # indptr  = [0, 3, 5]
+        # # 获取对应的数据
+        # # - 第0条文本用 0:3 => indices=[3,8,20] , data=[0.7,0.2,0.1]
+        # # - 第1条文本用 3:5 => indices=[1,9] , data=[0.6,0.4]
         for i in range(len(texts)):
             # 提取第i个文本的稀疏向量索引：np.int64 → Python int（满足字典key可哈希要求）
             sparse_indices = embeddings["sparse"].indices[
@@ -85,6 +96,8 @@ def generate_embeddings(texts):
 
         # 构造最终返回结果，稠密向量转列表（解决numpy数组不可序列化问题）
         result = {
+            # embeddings["dense"] = [[1稠密向量],[2稠密向量],[...]  -> 1024]
+            # embeddings["sparse"] = [[1稀疏向量],[2稠密向量],[...]  -> 1024]
             "dense": [emb.tolist() for emb in embeddings["dense"]],  # 嵌套列表，与输入文本一一对应
             "sparse": processed_sparse  # 字典列表，模型已做L2归一化
         }
