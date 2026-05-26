@@ -17,10 +17,11 @@ from app.lm.lm_utils import get_llm_client
 from app.lm.embedding_utils import generate_embeddings
 from app.clients.milvus_utils import get_milvus_client, create_hybrid_search_requests, hybrid_search
 from dotenv import load_dotenv,find_dotenv
-from app.core.logger import logger, node_log
+from app.core.logger import logger, node_log, step_log
 
 load_dotenv(find_dotenv())
 
+@step_log("step_1_data_validates")
 def step_1_data_validates(state):
     """
     获取session_id和原始查询内容,并且进行校验处理!
@@ -34,10 +35,12 @@ def step_1_data_validates(state):
         raise ValueError("session_id和original_query不能为空")
     return original_query, session_id
 
+@step_log("step_2_chat_history")
 def step_2_chat_history(session_id):
     """历史聊天记录"""
     return get_recent_messages(session_id)
 
+@step_log("step_3_llm_item_names_and_rewrite")
 def step_3_llm_item_names_and_rewrite(history_message_list, original_query):
     """
     进行item_name和rewritten_query识别
@@ -74,6 +77,7 @@ def step_3_llm_item_names_and_rewrite(history_message_list, original_query):
     # 5. 返回结果即可
     return llm_json_dict
 
+@step_log("step_4_vector_query_item_name")
 def step_4_vector_query_item_name(item_names):
     """
        a -> 向量 -> 两个annSearchRequest -> hy_search -> 结果
@@ -149,6 +153,7 @@ def step_4_vector_query_item_name(item_names):
     # 5. 最终返回结果
     return vector_dict
 
+@step_log("step_5_select_item_name_list")
 def step_5_select_item_name_list(vector_dict):
     """
     作用: 在向量查询的列表中,选出确定和可选的item_name列表
@@ -198,6 +203,7 @@ def step_5_select_item_name_list(vector_dict):
         "options_item_name_list": options_item_name_list
     }
 
+@step_log("step_6_deal_state")
 def step_6_deal_state(state, final_result, rewritten_query):
     """
     修改state : answer  item_names rewritten_query
@@ -226,6 +232,7 @@ def step_6_deal_state(state, final_result, rewritten_query):
     # 3. 可选都没有,无法确定无法可选,给与提示,明确即可
     state["answer"] = "未找到相关产品，请提供准确型号以便我为您查询。"
 
+@step_log("step_7_save_user_chat_message")
 def step_7_save_user_chat_message(state):
     # 进行用户聊天记录保存
     save_chat_message(
@@ -236,6 +243,7 @@ def step_7_save_user_chat_message(state):
         item_names=state["item_names"]
     )
 
+@node_log("node_item_name_confirm")
 def node_item_name_confirm(state):
     """
     节点功能：确认用户问题中的核心商品名称。
