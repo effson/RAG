@@ -1,0 +1,175 @@
+from pathlib import Path
+import uuid
+import uvicorn
+from fastapi import FastAPI, BackgroundTasks, HTTPException, Request
+from fastapi.responses import FileResponse, StreamingResponse
+from pydantic import BaseModel, Field
+from starlette.middleware.cors import CORSMiddleware
+from app.core.logger import logger, PROJECT_ROOT
+
+
+from mimetypes import guess_type
+
+from app.query_process.agent.state import create_query_default_state
+from app.utils.task_utils import *
+from app.utils.sse_utils import create_sse_queue, SSEEvent, sse_generator
+from app.clients.mongo_history_utils import *
+from app.query_process.agent.main_graph import query_app
+
+
+# 定义fastapi对象
+app = FastAPI(title="query service", description="掌柜智库查询服务！")
+
+# 跨域配置
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# 接口1: 返回html页面  url: /query/html  get  没有参数  响应html文件
+@app.get("/query/html")
+def return_query_html():
+    #1.拼接地址
+    html_path_obj = PROJECT_ROOT / "app" / "query_process" / "page" / "chat.html"
+    #2.判断文件是否存在
+    if not html_path_obj.exists():
+        logger.error(f"html不存在,无法返回页面!")
+        raise HTTPException(status_code=404,detail=f"html不存在,无法返回页面!")
+    #3.响应文件数据 [json Dict BaseModel 文件 FileResponse 流式 xxx ]
+    return FileResponse(
+        path=html_path_obj,
+        media_type=guess_type(html_path_obj.name)[0]
+    )
+
+# 接口二: /health 健康检查接口  /health  get  没有参数  {"ok":True}
+@app.get("/health")
+def health():
+    return {
+        "ok":True
+    }
+
+# 定义接口接收的数据结构
+class QueryRequest(BaseModel):
+    """查询请求数据结构"""
+    query: str = Field(..., description="查询内容")
+    session_id: str = Field(None, description="会话ID")
+    is_stream: bool = Field(False, description="是否流式返回")
+
+# 同步方法
+def run_query_graph(session_id: str, query: str, is_stream: bool):
+    """执行main_graph"""
+    try:
+
+        # 清空原有的任务列表
+        clear_task(session_id)
+        # 更新新状态
+        update_task_status(session_id, TASK_STATUS_PROCESSING, is_stream)
+
+        # 执行
+        initial_state = (
+            create_query_default_state(
+                session_id=session_id,
+                original_query=query,
+                is_stream = is_stream
+            )
+        )
+
+        query_app.invoke(initial_state)
+        update_task_status(session_id, TASK_STATUS_COMPLETED, is_stream)
+
+        # final事件一定最后推送, 因为他会关闭本次流
+        image_urls = ["http://www.baidu.com/img/bd_logo.png",
+                      "http://47.94.86.115:9000/knowledge-base-files/upload-images/hak180%E4%BA%A7%E5%93%81%E5%AE%89%E5%85%A8%E6%89%8B%E5%86%8C/66ee4447cdd36e786369677a3a3aa8c36cedbfd2cdc10dde42ad9da98edefeab.jpg"]
+        push_to_session(
+            session_id,
+            SSEEvent.FINAL,
+            {
+                "answer": get_task_result(session_id, "answer"),
+                "status": "completed",
+                "image_urls": image_urls
+            }
+        )
+    except Exception as e:
+        logger.exception(f"执行{session_id}对应查询问题:{query},任务执行失败! 错误信息:{str(e)}")
+        update_task_status(session_id, TASK_STATUS_FAILED, is_stream)
+
+# 接口三: 前端提问查询接口
+# /query
+# method = post
+# 参数json: {query:"提问内容",session_id:当前会话的id,is_stream:流式处理}
+# 响应json: 流式: { "message": "结果正在处理中...", "session_id": "xxx-uuid" }
+#          非流式: { "message": "处理完成！", "session_id": "xxx", "answer": "回答内容...", "done_list": [] }
+@app.post("/query")
+async def query(query_request: QueryRequest, backgroundtasks:BackgroundTasks):
+    is_stream = query_request.is_stream
+    session_id = query_request.session_id
+    query = query_request.query
+
+    if is_stream:
+        # 异步流式
+        create_sse_queue(session_id)  # [sse -> queue ]
+
+        backgroundtasks.add_task(run_query_graph, session_id, query, is_stream)
+        return  {
+            "message": "结果正在处理中...",
+            "session_id": session_id
+        }
+    else:
+        # 同步执行,等待执行
+        run_query_graph(session_id, query, is_stream)
+        answer = get_task_result(session_id, "answer")
+
+        return {
+            "message": "处理完成！",
+            "session_id": session_id,
+            "answer": answer,
+            "done_list": get_done_task_list(session_id)
+        }
+
+# 接口四: 流式获取结果  `/stream/{session_id}` (GET)
+@app.get("/stream/{session_id}")
+async def stream_query_result(session_id:str , request:Request):
+    return StreamingResponse(
+        sse_generator(session_id, request), # 生成器 函数 yield
+        media_type = "text/event-stream" # 返回结果类型
+    )
+
+# 接口五: 查询历史聊天记录  /history/{session_id}?limit=xx 可能传 可能不传?
+@app.get("/history/{session_id}")
+def get_history(session_id: str,limit: int = 10):
+    records = get_recent_messages(session_id, limit=limit)
+    items = []
+    for r in records:
+        items.append({
+            "_id": str(r.get("_id")) if r.get("_id") is not None else "",
+            "session_id": r.get("session_id", ""),
+            "role": r.get("role", ""),
+            "text": r.get("text", ""),
+            "rewritten_query": r.get("rewritten_query", ""),
+            "item_names": r.get("item_names", []),
+            "ts": r.get("ts")
+        })
+    return {
+        "session_id":session_id,
+        "items":items
+    }
+
+# 接口六: 清空历史聊天记录
+# /history/{session_id}  delete
+@app.delete("/history/{session_id}")
+def delete_history(session_id:str):
+    # 删除
+    delete_count = clear_history(session_id)
+    return {
+        "message":f"删除:{session_id}会话对应的聊天记录成功!!",
+        "delete_count":delete_count
+    }
+
+if __name__ == "__main__":
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8001
+    )

@@ -208,7 +208,7 @@ def get_recent_messages(session_id: str, limit: int = 10) -> List[Dict[str, Any]
         # find(query)：获取符合条件的游标（惰性加载，不立即查询）
         # sort("ts", ASCENDING)：按ts字段升序（从旧到新），适配LLM上下文顺序
         # limit(limit)：限制返回的最大条数
-        cursor = mongo_tool.chat_message.find(query).sort("ts", DESCENDING).limit(limit)
+        cursor = mongo_tool.chat_message.find(query).sort("ts", ASCENDING).limit(limit)
         # 将游标转为列表，触发实际数据库查询，获取所有符合条件的文档
         messages = list(cursor)
         # 返回查询结果列表

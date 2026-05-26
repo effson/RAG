@@ -144,7 +144,7 @@ async def get_task_progress(task_id: str):
     """
     任务状态查询接口
     前端轮询此接口（如每秒1次），获取任务的实时处理进度
-    返回数据均来自内存中的任务管理字典（task_utils.py），高性能无IO
+    返回数据均来自内存中的任务管理字典（task_utils.py），高性能无 IO
 
     :param task_id: 全局唯一任务ID（由/upload接口返回）
     :return: 包含任务全局状态、已完成节点、运行中节点的JSON响应
