@@ -85,7 +85,7 @@ def step_4_milvus_hybrid_search(dense_vector, sparse_vector, item_names):
         limit=5,
         output_fields=["chunk_id","item_name","content","title","parent_title","part","file_title"]
     )
-    return resp[0] if len(resp) > 0 else []
+    return resp[0] if resp and len(resp) > 0 else []
 
 def node_search_embedding_hyde(state):
     """
