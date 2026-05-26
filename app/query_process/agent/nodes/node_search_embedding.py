@@ -37,8 +37,8 @@ def step_3_milvus_hybrid_search(dense_vector, sparse_vector, item_names):
     向量搜索
         混合搜索 +  过滤条件  item_name in [a,b,c] mivlus ->mysql ()
     混合搜索步骤:
-        1. 创建对应AnnSearchRequest
-        2. 定义对应reranker
+        1. 创建对应 AnnSearchRequest
+        2. 定义对应 reranker
         3. 调用混合检索方法就行
     :param dense_vector:
     :param sparse_vector:

@@ -80,7 +80,7 @@ def step_4_milvus_hybrid_search(dense_vector, sparse_vector, item_names):
         client= mivlus_client,
         collection_name=milvus_config.chunks_collection,
         reqs=reqs,
-        ranker_weights=(0.9,0.1),
+        ranker_weights=(0.9, 0.1),
         norm_score=True,
         limit=5,
         output_fields=["chunk_id","item_name","content","title","parent_title","part","file_title"]

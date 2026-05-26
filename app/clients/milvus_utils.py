@@ -167,7 +167,7 @@ def hybrid_search(client, collection_name, reqs, ranker_weights=(0.5, 0.5), norm
     :param norm_score: 是否归一化评分后再融合，避免评分量级差异导致权重失效
     :param limit: 混合搜索最终返回结果数量，默认5
     :param output_fields: 需要返回的字段列表，默认返回item_name
-    :param search_params: 搜索参数，如ef/topk等，默认None
+    :param search_params: 搜索参数，如 ef/top_k等，默认None
     :return: 混合搜索结果列表，搜索失败返回None
     """
     try:
