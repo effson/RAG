@@ -104,7 +104,7 @@ def step_2_data_chunk_title(md_content: str, file_title: str) -> List[Dict[str, 
         match = reg.match(line)
         if match and not is_code_block:
             # 满足标题的结果 # xxx 并且不在代码块! 真标题 结算上一个标题的内容
-            if current_title: # 第二个之后的标题, 将上一份标题内容存储chunks内部
+            if current_title and len(current_title_lines) > 1:  # 第二个之后的标题, 将上一份标题内容存储chunks内部
                 chunks.append({ # current_title_lines = [行,行,行,行]
                     "content": "\n".join(current_title_lines),
                     "title": current_title,
