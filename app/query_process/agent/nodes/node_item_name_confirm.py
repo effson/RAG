@@ -101,7 +101,7 @@ def step_4_vector_query_item_name(item_names):
         sparse_vector = item_name_dict["sparse"][index]
 
         # 将稠密和稀疏向量分别转成AnnSearchRequest
-        # 调用了 mivlus 封装的方法,内部帮我们创建两个AnnSearchRequest 默认: limit = 5
+        # 调用了 milvus 封装的方法,内部帮我们创建两个AnnSearchRequest 默认: limit = 5
         reqs = create_hybrid_search_requests(dense_vector,sparse_vector) # todo: 相似度全部改为 IP [当初创建集合索引的类型]
 
         # 正常定义一个rerank工具,调用混合检索函数进行搜索结果

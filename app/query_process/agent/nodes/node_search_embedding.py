@@ -32,7 +32,7 @@ def step_2_rewritten_query_vector(rewritten_query):
     return result['dense'][0], result['sparse'][0]
 
 @step_log("step_3_mivlus_hybrid_search")
-def step_3_mivlus_hybrid_search(dense_vector, sparse_vector, item_names):
+def step_3_milvus_hybrid_search(dense_vector, sparse_vector, item_names):
     """
     向量搜索
         混合搜索 +  过滤条件  item_name in [a,b,c] mivlus ->mysql ()
@@ -76,12 +76,12 @@ def node_search_embedding(state):
     dense_vector, sparse_vector = step_2_rewritten_query_vector(rewritten_query)
 
     # 3. 进行混合检索(过滤条件/双向量和权重设置/输出字段控制)
-    mivlus_result = step_3_mivlus_hybrid_search(dense_vector, sparse_vector, item_names)
+    mivlus_result = step_3_milvus_hybrid_search(dense_vector, sparse_vector, item_names)
     # ...
     add_done_task(state["session_id"], sys._getframe().f_code.co_name, state.get("is_stream"))
 
     print("---量内容检索 处理结束---")
-    return {"embedding_chunks":mivlus_result}
+    return {"embedding_chunks": mivlus_result}
 
 if __name__ == "__main__":
     # 模拟测试数据
