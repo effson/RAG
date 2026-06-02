@@ -3,7 +3,7 @@ import os
 # 导入日志模块：用于记录程序运行日志（成功/失败/错误信息）
 import logging
 # 导入类型注解模块：用于函数参数/返回值的类型提示，提升代码可读性和规范性
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 # 导入时间模块：用于生成时间戳，记录对话的创建时间
 from datetime import datetime
 # 导入pymongo核心模块：MongoDB原生Python驱动，实现数据库连接和操作
@@ -13,7 +13,10 @@ from pymongo import MongoClient, ASCENDING, DESCENDING
 from bson import ObjectId
 # 导入dotenv模块：用于从.env文件加载环境变量，避免硬编码敏感配置（如MongoDB连接地址）
 from dotenv import load_dotenv
-
+# 导入大模型客户端获取函数（根据 CLAUDE.md 规范，使用项目自带的包装器）
+from app.lm.lm_utils import get_llm_client
+# 导入 Prompt 加载函数（根据 CLAUDE.md 规范，从 externalized prompts 加载）
+from app.core.load_prompt import load_prompt
 # 加载.env文件中的环境变量，使os.getenv能读取到配置
 load_dotenv()
 
@@ -41,11 +44,14 @@ class HistoryMongoTool:
             self.db = self.client[self.db_name]
             # 获取对话记录的集合（相当于关系型数据库的表），集合名：chat_message
             self.chat_message = self.db["chat_message"]
-
+            # 集合 2：高阶记忆体集合（存储增量摘要与独立约束变体）
+            self.chat_summary = self.db["chat_summary"]
             # 为chat_message集合创建复合索引，提升查询性能
             # 索引规则：session_id升序 + ts降序，适配"按会话查最新记录"的核心查询场景
             # create_index自带幂等性：索引已存在时不会重复创建，无需额外判断
             self.chat_message.create_index([("session_id", 1), ("ts", -1)])
+            # 为 chat_summary 建立唯一索引：一个会话对应一条全局记忆
+            self.chat_summary.create_index([("session_id", 1)], unique=True)
 
             # 记录成功日志，确认数据库连接和初始化完成
             logging.info(f"Successfully connected to MongoDB: {self.db_name}")
@@ -95,6 +101,8 @@ def clear_history(session_id: str) -> int:
     try:
         # 执行批量删除操作：删除所有session_id匹配的文档
         result = mongo_tool.chat_message.delete_many({"session_id": session_id})
+        # 清空高阶记忆体
+        sum_result = mongo_tool.chat_summary.delete_one({"session_id": session_id})
         # 记录删除成功日志，包含删除数量和会话ID，便于问题排查
         logging.info(f"Deleted {result.deleted_count} messages for session {session_id}")
         # 返回实际删除的数量（delete_many的返回对象包含deleted_count属性）
@@ -158,6 +166,176 @@ def save_chat_message(
         # 新增操作返回插入的ObjectId并转为字符串，便于上层使用（避免直接返回ObjectId对象）
         return str(result.inserted_id)
 
+# ==================== 核心跃迁：智能压缩与记忆注入模块 ====================
+
+def get_session_memory(session_id: str) -> Tuple[str, List[str]]:
+    """
+    获取指定会话的高阶记忆体（结构化摘要 + 用户独立约束列表）
+    :return: (summary_text, constraints_list)
+    """
+    mongo_tool = get_history_mongo_tool()
+    memory = mongo_tool.chat_summary.find_one({"session_id": session_id})
+    if memory:
+        return memory.get("summary", ""), memory.get("constraints", [])
+    return "", []
+
+
+def get_llm_context_messages(session_id: str, window_size: int = 6) -> List[Dict[str, Any]]:
+    """
+    核心注入函数：获取喂给大模型的最终上下文消息列表
+    机制：强制拉取高阶记忆体中的【全局约束】和【结构化摘要】作为系统提示的前置，再追加最近的明细。
+
+    :param session_id: 会话唯一标识
+    :param window_size: 保留原样的最近对话明细条数（建议 6 条，即 3 轮完整问答）
+    :return: 拼装好的基础消息字典列表，可直接扔给大模型
+    """
+    # 1. 优先获取该用户的长期记忆体（摘要与独立偏好）
+    summary, constraints = get_session_memory(session_id)
+
+    context_messages = []
+
+    # 2. 如果存在硬约束或长期摘要，构造一个高阶系统常驻节点注入进去
+    system_text = "【核心系统记忆库】\n"
+    if constraints:
+        system_text += "## 用户核心约束与绝对偏好（每次对话务必强制遵守）：\n"
+        for i, con in enumerate(constraints, 1):
+            system_text += f"{i}. {con}\n"
+    if summary:
+        system_text += f"\n## 前期历史对话的结构化摘要（供上下文参考）：\n{summary}\n"
+
+    if constraints or summary:
+        context_messages.append({"role": "system", "text": system_text})
+
+    # 3. 获取最近的 N 条明细（按时间戳正序，保证连贯性）
+    mongo_tool = get_history_mongo_tool()
+    query = {"session_id": session_id}
+    # 先按时间倒序拉取指定条数，确保拿到的是“最近最新”的明细
+    cursor = mongo_tool.chat_message.find(query).sort("ts", DESCENDING).limit(window_size)
+    recent_msgs = list(cursor)
+    # 反转回正序，使其符合正常的对话发生线索
+    recent_msgs.reverse()
+
+    for msg in recent_msgs:
+        context_messages.append({
+            "role": msg["role"],
+            "text": msg["text"]
+        })
+
+    return context_messages
+
+
+def trigger_memory_compress_pipeline(session_id: str, threshold: int = 15, keep_tail: int = 6):
+    """
+    增量压缩流水线：判断明细是否达到阈值，若满足则调用 LLM 进行增量合并、约束提取，并清洗老旧明细。
+    建议在 LangGraph 流程的最后一个节点（Answer Output 之后）以异步任务（BackgroundTask）形式调用。
+
+    :param session_id: 会话 ID
+    :param threshold: 触发压缩的明细最大条数阈值（如超过 15 条开始压缩）
+    :param keep_tail: 压缩后保留最新几条明细不被删除（必须小于等于 window_size，保证衔接平滑）
+    """
+    mongo_tool = get_history_mongo_tool()
+    query = {"session_id": session_id}
+    total_count = mongo_tool.chat_message.count_documents(query)
+
+    # 未达到压缩阈值，直接闪退，不产生额外的 LLM 消耗
+    if total_count <= threshold:
+        return
+
+    try:
+        # 1. 捞出所有对话明细（按时间正序）进行合并抽取
+        all_msgs = list(mongo_tool.chat_message.find(query).sort("ts", ASCENDING))
+
+        # 截取出需要被打包进摘要的“老旧明细段”，最新的 keep_tail 条留着原样对话
+        compress_segment = all_msgs[:-keep_tail]
+        remain_segment = all_msgs[-keep_tail:]
+
+        if not compress_segment:
+            return
+
+        # 格式化当前需要处理的代码明细流
+        history_str = ""
+        for msg in compress_segment:
+            history_str += f"{msg['role']}: {msg['text']}\n"
+
+        # 2. 读取目前已有的老摘要与偏好约束
+        old_summary, old_constraints = get_session_memory(session_id)
+
+        # 3. 通过包装器调用 LLM（使用 CLAUDE.md 中推荐的通晓项目上下文的 qwen-flash 或类似模型）
+        llm = get_llm_client(model=os.getenv("LLM_DEFAULT_MODEL", "qwen-flash"))
+
+        # 4. 加载专有记忆提取 Prompt 模板（规范要求外部化存储在 prompts 目录下）
+        # 提示词要求 LLM 返回特定格式，如：
+        # ---SUMMARY---
+        # 新的压缩摘要...
+        # ---CONSTRAINTS---
+        # 偏好1
+        # 偏好2
+        prompt_template = load_prompt(
+            "memory_compress_agent",
+            old_summary=old_summary,
+            new_history=history_str,
+            old_constraints="\n".join(old_constraints) if old_constraints else "无"
+        )
+
+        # 走大模型提取推理
+        response = llm.invoke(prompt_template)
+        response_text = response.content
+
+        # 5. 解析 LLM 生成的结构化文本（解析器安全熔断）
+        new_summary, new_constraints = _parse_llm_memory_output(response_text, old_constraints)
+
+        # 6. 将新的高级复合记忆原子地更新/写入 chat_summary 集合
+        mongo_tool.chat_summary.update_one(
+            {"session_id": session_id},
+            {
+                "$set": {
+                    "summary": new_summary,
+                    "constraints": new_constraints,
+                    "last_compressed_ts": datetime.now().timestamp()
+                }
+            },
+            upsert=True
+        )
+
+        # 7. 清洗策略：安全擦除已被压缩的远古明细，仅保留最新的 remain_segment
+        # 利用 remain_segment 第一条的时间戳作为分水岭，早于它的全部抹除
+        boundary_ts = remain_segment[0]["ts"]
+        del_result = mongo_tool.chat_message.delete_many({
+            "session_id": session_id,
+            "ts": {"$lt": boundary_ts}
+        })
+
+        logging.info(
+            f"Successfully compressed session {session_id}. Garbage collected {del_result.deleted_count} messages.")
+
+    except Exception as e:
+        logging.error(f"Error executing memory compress pipeline for {session_id}: {e}")
+
+
+def _parse_llm_memory_output(llm_output: str, default_constraints: List[str]) -> Tuple[str, List[str]]:
+    """
+    解析大模型返回的结构化文本，剥离出摘要与约束列表。
+    防幻觉防炸裂兜底设计。
+    """
+    try:
+        summary_part = ""
+        constraints_part = []
+
+        if "---SUMMARY---" in llm_output and "---CONSTRAINTS---" in llm_output:
+            parts = llm_output.split("---CONSTRAINTS---")
+            summary_part = parts[0].replace("---SUMMARY---", "").strip()
+
+            # 提取约束列表
+            raw_cons = parts[1].strip().split("\n")
+            for con in raw_cons:
+                clean_con = con.strip().lstrip("0123456789.-*• ")
+                if clean_con:
+                    constraints_part.append(clean_con)
+            return summary_part, constraints_part
+    except Exception as e:
+        logging.warning(f"Regex/Split parse error on memory agent output, fallback to safe storage: {e}")
+
+    return llm_output, default_constraints
 
 def update_message_item_names(ids: List[str], item_names: List[str]) -> int:
     """
