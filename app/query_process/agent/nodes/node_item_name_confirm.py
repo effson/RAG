@@ -219,6 +219,7 @@ def step_6_deal_state(state, final_result, rewritten_query):
         # 成功
         state['item_names'] = confirmed_item_name_list
         state['rewritten_query'] = rewritten_query
+        logger.info(f"item_names : {state['item_names']}")
         if "answer" in state:
             del state["answer"]
         return
@@ -228,9 +229,11 @@ def step_6_deal_state(state, final_result, rewritten_query):
         # 名字、xxxx
         option_name_str = "、".join(options_item_name_list)
         state["answer"] = f"您是想问以下哪个产品：{option_name_str}？请明确一下型号。"
+        logger.info(f"answer : {state["answer"]}")
         return
     # 3. 可选都没有,无法确定无法可选,给与提示,明确即可
     state["answer"] = "未找到相关产品，请提供准确型号以便我为您查询。"
+    logger.info(f"answer : {state["answer"]}")
 
 @step_log("step_7_save_user_chat_message")
 def step_7_save_user_chat_message(state):
@@ -265,7 +268,7 @@ def node_item_name_confirm(state):
     llm_result_dict = step_3_llm_item_names_and_rewrite(history_message_list, original_query)
     item_names = llm_result_dict['item_names']
     rewritten_query = llm_result_dict['rewritten_query']
-
+    logger.info(f"milvus提取到的的item_names : {item_names}")
     # {确认item_name:[] , 可选的item_name:[]}
     final_result = {}
     if item_names and len(item_names) > 0:
@@ -294,7 +297,7 @@ def node_item_name_confirm(state):
 
     print(f"---node_item_name_confirm---处理结束")
 
-    return {"item_names": ["示例商品"]}
+    return state
 
 if __name__ == "__main__":
     # 模拟输入状态

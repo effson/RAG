@@ -76,12 +76,11 @@ def run_query_graph(session_id: str, query: str, is_stream: bool):
             )
         )
 
-        query_app.invoke(initial_state)
+        state = query_app.invoke(initial_state)
         update_task_status(session_id, TASK_STATUS_COMPLETED, is_stream)
 
         # final事件一定最后推送, 因为他会关闭本次流
-        image_urls = ["http://www.baidu.com/img/bd_logo.png",
-                      "http://47.94.86.115:9000/knowledge-base-files/upload-images/hak180%E4%BA%A7%E5%93%81%E5%AE%89%E5%85%A8%E6%89%8B%E5%86%8C/66ee4447cdd36e786369677a3a3aa8c36cedbfd2cdc10dde42ad9da98edefeab.jpg"]
+        image_urls = state['image_urls']
         push_to_session(
             session_id,
             SSEEvent.FINAL,
