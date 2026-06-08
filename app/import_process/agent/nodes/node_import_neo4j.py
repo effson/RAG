@@ -464,13 +464,13 @@ def step_4_build_cypher(
             {"chunk_id": chunk_id, "item_name": chunk_item},
         ))
 
-    # 3. Chunk-Entity 提及关系
+    # 3. Entity-Chunk 提及关系（实体被提及于哪个 Chunk）
     for chunk_id, eref in chunk_entity_pairs:
         cypher_batch.append((
             """
-            MATCH (c:Chunk {id: $chunk_id})
             MATCH (e:Entity {name: $name, label: $label})
-            MERGE (c)-[:MENTIONS]->(e)
+            MATCH (c:Chunk {id: $chunk_id})
+            MERGE (e)-[:MENTIONED_IN]->(c)
             """,
             {"chunk_id": chunk_id, "name": eref.name, "label": eref.label},
         ))
