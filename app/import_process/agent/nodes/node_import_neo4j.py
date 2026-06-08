@@ -433,6 +433,16 @@ def step_4_build_cypher(
 
     cypher_batch: List[Tuple[str, Dict[str, Any]]] = []
 
+    # 0. 清理旧数据：删除所有带此 item_name 的节点及其关系
+    if global_item_name:
+        cypher_batch.append((
+            """
+            MATCH (n {item_name: $item_name})
+            DETACH DELETE n
+            """,
+            {"item_name": global_item_name},
+        ))
+
     # 1. 实体节点（仅以 name 为唯一标识）
     for eref in all_entities:
         cypher_batch.append((
