@@ -26,6 +26,10 @@ from app.utils.task_utils import add_running_task, add_done_task
 from app.core.logger import logger, node_log, step_log
 # 7. 提示词工具：加载本地prompt模板，实现提示词与代码解耦
 from app.core.load_prompt import load_prompt
+from pymilvus import DataType
+from app.lm.embedding_utils import generate_embeddings
+from app.clients.milvus_utils import get_milvus_client
+from app.conf.milvus_config import milvus_config
 
 
 # ---- 配置文件 ----
@@ -345,8 +349,8 @@ def step_2_extract_entities_relations(
     return extraction_results, stats
 
 
-@step_log("step_3_build_cypher")
-def step_3_build_cypher(
+@step_log("step_4_build_cypher")
+def step_4_build_cypher(
     state: ImportGraphState,
     extraction_results: List[Tuple[str, List[Dict], List[Dict]]],
     stats: ProcessingStats,
@@ -515,14 +519,142 @@ def step_3_build_cypher(
     return cypher_batch
 
 
-@step_log("step_4_execute_neo4j")
-def step_4_execute_neo4j(
+@step_log("step_3_import_entity_vectors")
+def step_3_import_entity_vectors(
+    state: ImportGraphState,
+    extraction_results: List[Tuple[str, List[Dict], List[Dict]]],
+) -> None:
+    """
+    将提取的实体名称通过 BGE-M3 生成稠密+稀疏向量，存入 Milvus 实体名称集合。
+
+    每个 (实体名, chunk_id) 对存储一条记录，支持按 chunk_id 追溯实体来源，
+    后续查询时可按实体名做稠密+稀疏混合检索，定位相关实体所在的文档切片。
+
+    :param state: 图状态（获取 item_name 等全局字段）
+    :param extraction_results: step_2 的提取结果 [(chunk_id, entities, relations), ...]
+    """
+    entity_collection = milvus_config.entity_name_collection
+    if not entity_collection:
+        logger.warning("未配置 ENTITY_NAME_COLLECTION，跳过实体向量入库")
+        return
+
+    # ---- 第一步：收集所有 (实体名, chunk_id, item_name) 三元组 ----
+    entity_rows: List[Dict[str, Any]] = []  # {entity_name, chunk_id, item_name}
+    seen_pairs: Set[Tuple[str, str]] = set()  # (entity_name, chunk_id) 去重
+
+    # 构建 chunk_id → item_name 快速查找表
+    chunk_item_map: Dict[str, str] = {}
+    for ch in state.get("chunks", []):
+        cid = str(ch.get("chunk_id", ""))
+        if cid:
+            chunk_item_map[cid] = str(ch.get("item_name", ""))
+
+    global_item_name = str(state.get("item_name", "")).strip()
+
+    for chunk_id, entities, _ in extraction_results:
+        chunk_id_str = str(chunk_id)
+        chunk_item = chunk_item_map.get(chunk_id_str, global_item_name)
+        if not chunk_item:
+            chunk_item = global_item_name
+
+        for ent in entities:
+            name = str(ent.get("name", "")).strip()
+            if not name:
+                continue
+            key = (name, chunk_id_str)
+            if key in seen_pairs:
+                continue
+            seen_pairs.add(key)
+            entity_rows.append({
+                "entity_name": name,
+                "chunk_id": int(chunk_id),
+                "item_name": chunk_item,
+            })
+
+    if not entity_rows:
+        logger.info("没有实体需要存入 Milvus 实体名称集合")
+        return
+
+    logger.info(f"准备为 {len(entity_rows)} 条 (实体, chunk) 对生成向量并入库")
+
+    # ---- 第二步：准备 Milvus 集合（获取客户端 + 不存在则创建） ----
+    milvus_client = get_milvus_client()
+    if milvus_client is None:
+        raise RuntimeError("Milvus 客户端不可用，无法写入实体向量。请检查 MILVUS_URL 配置。")
+
+    if not milvus_client.has_collection(entity_collection):
+        logger.info(f"Milvus 实体名称集合 [{entity_collection}] 不存在，自动创建")
+        schema = milvus_client.create_schema(
+            auto_id=True,
+            enable_dynamic_field=True,
+        )
+        schema.add_field(field_name="id", datatype=DataType.INT64, is_primary=True, auto_id=True)
+        schema.add_field(field_name="entity_name", datatype=DataType.VARCHAR, max_length=512)
+        schema.add_field(field_name="chunk_id", datatype=DataType.INT64)
+        schema.add_field(field_name="item_name", datatype=DataType.VARCHAR, max_length=512)
+        schema.add_field(field_name="dense_vector", datatype=DataType.FLOAT_VECTOR, dim=1024)
+        schema.add_field(field_name="sparse_vector", datatype=DataType.SPARSE_FLOAT_VECTOR)
+
+        index_params = milvus_client.prepare_index_params()
+        index_params.add_index(
+            field_name="dense_vector",
+            index_type="AUTOINDEX",
+            index_name="dense_vector_index",
+            metric_type="IP",
+        )
+        index_params.add_index(
+            field_name="sparse_vector",
+            index_type="SPARSE_INVERTED_INDEX",
+            index_name="sparse_vector_index",
+            metric_type="IP",
+            params={"inverted_index_algo": "DAAT_MAXSCORE"},
+        )
+        milvus_client.create_collection(
+            collection_name=entity_collection,
+            schema=schema,
+            index_params=index_params,
+        )
+        logger.info(f"Milvus 实体名称集合 [{entity_collection}] 创建完成")
+
+    # ---- 第三步：按 item_name 删除旧数据（幂等，在生成向量前清理） ----
+    if global_item_name:
+        try:
+            delete_expr = f"item_name=='{global_item_name}'"
+            milvus_client.delete(collection_name=entity_collection, filter=delete_expr)
+            logger.info(f"已清理实体名称集合中 item_name='{global_item_name}' 的旧数据")
+        except Exception as e:
+            logger.warning(f"清理实体名称旧数据异常（可能无旧数据）: {e}")
+
+    # ---- 第四步：调用 BGE-M3 生成稠密+稀疏向量 ----
+    entity_names = [row["entity_name"] for row in entity_rows]
+    embeddings = generate_embeddings(entity_names)
+
+    # ---- 第五步：组装待插入数据（向量附加到每一行） ----
+    insert_data: List[Dict[str, Any]] = []
+    for i, row in enumerate(entity_rows):
+        insert_data.append({
+            "entity_name": row["entity_name"],
+            "chunk_id": row["chunk_id"],
+            "item_name": row["item_name"],
+            "dense_vector": embeddings["dense"][i],
+            "sparse_vector": embeddings["sparse"][i],
+        })
+
+    # ---- 第六步：批量插入 ----
+    result = milvus_client.insert(collection_name=entity_collection, data=insert_data)
+    insert_count = result.get("insert_count", 0)
+    milvus_client.flush(collection_name=entity_collection)
+    logger.info(f"实体向量入库完成: {insert_count} 条记录 → Milvus集合[{entity_collection}]")
+
+
+@step_log("step_5_execute_neo4j")
+def step_5_execute_neo4j(
     cypher_batch: List[Tuple[str, Dict[str, Any]]], stats: ProcessingStats
 ):
     """
     执行 Cypher 批处理，将图谱数据写入 Neo4j。
 
-    :param cypher_batch: step_3 构建的 Cypher 语句列表
+    :param cypher_batch: step_4 构建的 Cypher 语句列表
     :param stats: 处理统计（会追加执行错误）
     """
     driver = get_neo4j_driver()
@@ -549,8 +681,8 @@ def step_4_execute_neo4j(
         logger.warning(f"有 {failed} 条 Cypher 执行失败，详情见 stats.errors")
 
 
-@step_log("step_5_update_state")
-def step_5_update_state(state: ImportGraphState, stats: ProcessingStats):
+@step_log("step_6_update_state")
+def step_6_update_state(state: ImportGraphState, stats: ProcessingStats):
     """
     将图谱构建结果写回 state。
 
@@ -574,7 +706,8 @@ def step_5_update_state(state: ImportGraphState, stats: ProcessingStats):
 @node_log("node_import_neo4j")
 def node_import_neo4j(state: ImportGraphState) -> ImportGraphState:
     """
-    节点功能：从文档切块中提取实体和关系，构建知识图谱并写入 Neo4j。
+    节点功能：从文档切块中提取实体和关系，构建知识图谱并写入 Neo4j，
+    同时将实体名称向量化存入 Milvus 实体名称集合，支持后续实体级混合检索。
 
     前置依赖：
       - state["chunks"] 中每个 chunk 须包含 chunk_id（由 node_import_milvus 回写）
@@ -582,6 +715,7 @@ def node_import_neo4j(state: ImportGraphState) -> ImportGraphState:
 
     产出：
       - Neo4j 中的 Document / ItemName / Chunk / Entity 节点及关系
+      - Milvus 实体名称集合中的实体稠密+稀疏向量（可按实体名做混合检索）
       - state["kg_id"] / state["kg_stats"]
     """
     # 日志+任务处理
@@ -595,14 +729,17 @@ def node_import_neo4j(state: ImportGraphState) -> ImportGraphState:
         validated_chunks, global_item_name
     )
 
-    # 3. 去重 + 构建 Cypher 语句
-    cypher_batch = step_3_build_cypher(state, extraction_results, stats)
+    # 3. 实体名称向量化并存入 Milvus
+    step_3_import_entity_vectors(state, extraction_results)
 
-    # 4. 执行 Cypher 写入 Neo4j
-    step_4_execute_neo4j(cypher_batch, stats)
+    # 4. 去重 + 构建 Cypher 语句
+    cypher_batch = step_4_build_cypher(state, extraction_results, stats)
 
-    # 5. 更新 state
-    step_5_update_state(state, stats)
+    # 5. 执行 Cypher 写入 Neo4j
+    step_5_execute_neo4j(cypher_batch, stats)
+
+    # 6. 更新 state
+    step_6_update_state(state, stats)
 
     # 日志+任务处理
     add_done_task(state["task_id"], "node_import_neo4j")
@@ -656,7 +793,7 @@ if __name__ == "__main__":
         if driver is None:
             logger.error("Neo4j 不可用，测试终止。请检查 .env 配置或启动 Neo4j 服务。")
         else:
-            # 注意：不要在这里 driver.close()，因为 step_4 会通过单例获取同一个 driver
+            # 注意：不要在这里 driver.close()，因为 step_5 会通过单例获取同一个 driver
             result_state = node_import_neo4j(test_state)
             kg_stats = result_state.get("kg_stats", {})
             logger.info(f"===== 测试完成 =====")
