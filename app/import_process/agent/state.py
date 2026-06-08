@@ -38,6 +38,10 @@ class ImportGraphState(TypedDict):
     # --- 数据库相关 ---
     embeddings_content: list # 包含向量数据的列表，准备写入 Milvus
 
+    # --- 知识图谱相关 ---
+    kg_id: str            # 知识图谱导入标识（复用 task_id）
+    kg_stats: dict        # 图谱构建统计（实体数/关系数/错误列表等）
+
 
 # 建议定一个初始化对象，方便后续使用
 # 定义图状态的默认初始值
@@ -59,7 +63,9 @@ graph_default_state: ImportGraphState = {
     "md_content": "",
     "chunks": [],
     "item_name": "",
-    "embeddings_content": []
+    "embeddings_content": [],
+    "kg_id": "",
+    "kg_stats": {},
 }
 
 def create_default_state(**overrides) -> ImportGraphState:

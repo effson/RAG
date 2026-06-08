@@ -14,6 +14,7 @@ from app.import_process.agent.nodes.node_document_split import node_document_spl
 from app.import_process.agent.nodes.node_item_name_recognition import node_item_name_recognition  # 项目名识别：从分块中提取核心项目名称（业务定制化）
 from app.import_process.agent.nodes.node_bge_embedding import node_bge_embedding  # BGE向量化：将文本分块转换为向量表示（适配Milvus向量库）
 from app.import_process.agent.nodes.node_import_milvus import node_import_milvus  # 导入Milvus：将向量数据写入Milvus向量数据库
+from app.import_process.agent.nodes.node_import_neo4j import node_import_neo4j  # 导入Neo4j：从切块提取实体关系，构建知识图谱
 
 
 # 初始化环境变量：必须在配置读取前执行，确保后续节点能获取到环境变量中的配置信息
@@ -29,6 +30,7 @@ workflow.add_node("node_document_split",node_document_split)
 workflow.add_node("node_item_name_recognition",node_item_name_recognition)
 workflow.add_node("node_bge_embedding",node_bge_embedding)
 workflow.add_node("node_import_milvus",node_import_milvus)
+workflow.add_node("node_import_neo4j",node_import_neo4j)
 
 # 3. 指定入口节点 workflow.add_edge(START,"node_entry")
 workflow.set_entry_point("node_entry")
@@ -66,7 +68,8 @@ workflow.add_edge("node_md_img", "node_document_split")
 workflow.add_edge("node_document_split", "node_item_name_recognition")
 workflow.add_edge("node_item_name_recognition", "node_bge_embedding")
 workflow.add_edge("node_bge_embedding", "node_import_milvus")
-workflow.add_edge("node_import_milvus", END)
+workflow.add_edge("node_import_milvus", "node_import_neo4j")
+workflow.add_edge("node_import_neo4j", END)
 
 # 6. 编译图对象即可
 kb_import_app = workflow.compile()
