@@ -433,29 +433,7 @@ def step_4_build_cypher(
 
     cypher_batch: List[Tuple[str, Dict[str, Any]]] = []
 
-    # 1. 文档节点
-    cypher_batch.append((
-        """
-        MERGE (d:Document {file_title: $file_title})
-        SET d.task_id = $task_id,
-            d.item_name = $item_name
-        """,
-        {"file_title": file_title, "task_id": task_id, "item_name": global_item_name},
-    ))
-
-    # 2. 产品名称节点 + 关联
-    if global_item_name:
-        cypher_batch.append((
-            """
-            MERGE (i:ItemName {name: $item_name})
-            WITH i
-            MATCH (d:Document {file_title: $file_title})
-            MERGE (d)-[:DESCRIBES]->(i)
-            """,
-            {"item_name": global_item_name, "file_title": file_title},
-        ))
-
-    # 3. 实体节点
+    # 1. 实体节点
     for eref in all_entities:
         cypher_batch.append((
             """
@@ -464,42 +442,40 @@ def step_4_build_cypher(
             {"name": eref.name, "label": eref.label},
         ))
 
-    # 4. Chunk 节点 + 归属关系
+    # 2. Chunk 节点（id + item_name，不再挂载到 Document）
     seen_chunk_ids: Set[str] = set()
+    # chunk_id → item_name 快速查找表
+    chunk_item_map: Dict[str, str] = {}
+    for ch in state.get("chunks", []):
+        cid = str(ch.get("chunk_id", ""))
+        if cid:
+            chunk_item_map[cid] = str(ch.get("item_name", global_item_name))
+
     for chunk_id, _, _ in extraction_results:
         if chunk_id in seen_chunk_ids:
             continue
         seen_chunk_ids.add(chunk_id)
-        # 找到对应 chunk 的元信息
-        chunk_title = ""
-        for ch in state.get("chunks", []):
-            if str(ch.get("chunk_id", "")) == chunk_id:
-                chunk_title = str(ch.get("title", ""))
-                break
+        chunk_item = chunk_item_map.get(chunk_id, global_item_name)
         cypher_batch.append((
             """
-            MERGE (c:Chunk {chunk_id: $chunk_id})
-            SET c.title = $title
-            WITH c
-            MATCH (d:Document {file_title: $file_title})
-            MERGE (c)-[:BELONGS_TO]->(d)
-            MERGE (d)-[:HAS_CHUNK]->(c)
+            MERGE (c:Chunk {id: $chunk_id})
+            SET c.item_name = $item_name
             """,
-            {"chunk_id": chunk_id, "title": chunk_title, "file_title": file_title},
+            {"chunk_id": chunk_id, "item_name": chunk_item},
         ))
 
-    # 5. Chunk-Entity 提及关系
+    # 3. Chunk-Entity 提及关系
     for chunk_id, eref in chunk_entity_pairs:
         cypher_batch.append((
             """
-            MATCH (c:Chunk {chunk_id: $chunk_id})
+            MATCH (c:Chunk {id: $chunk_id})
             MATCH (e:Entity {name: $name, label: $label})
             MERGE (c)-[:MENTIONS]->(e)
             """,
             {"chunk_id": chunk_id, "name": eref.name, "label": eref.label},
         ))
 
-    # 6. 实体间关系（使用 LLM 指定的关系类型作为 Neo4j 关系 Type）
+    # 4. 实体间关系（使用 LLM 指定的关系类型作为 Neo4j 关系 Type）
     for rref in all_relations:
         rel_type = rref.rel_type  # 已通过白名单校验，可直接用于 Cypher
         cypher_batch.append((
