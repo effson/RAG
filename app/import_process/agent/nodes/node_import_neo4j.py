@@ -433,13 +433,13 @@ def step_4_build_cypher(
 
     cypher_batch: List[Tuple[str, Dict[str, Any]]] = []
 
-    # 1. 实体节点
+    # 1. 实体节点（仅以 name 为唯一标识）
     for eref in all_entities:
         cypher_batch.append((
             """
-            MERGE (e:Entity {name: $name, label: $label})
+            MERGE (e:Entity {name: $name})
             """,
-            {"name": eref.name, "label": eref.label},
+            {"name": eref.name},
         ))
 
     # 2. Chunk 节点（id + item_name，不再挂载到 Document）
@@ -468,11 +468,11 @@ def step_4_build_cypher(
     for chunk_id, eref in chunk_entity_pairs:
         cypher_batch.append((
             """
-            MATCH (e:Entity {name: $name, label: $label})
+            MATCH (e:Entity {name: $name})
             MATCH (c:Chunk {id: $chunk_id})
             MERGE (e)-[:MENTIONED_IN]->(c)
             """,
-            {"chunk_id": chunk_id, "name": eref.name, "label": eref.label},
+            {"chunk_id": chunk_id, "name": eref.name},
         ))
 
     # 4. 实体间关系（使用 LLM 指定的关系类型作为 Neo4j 关系 Type）
@@ -480,13 +480,13 @@ def step_4_build_cypher(
         rel_type = rref.rel_type  # 已通过白名单校验，可直接用于 Cypher
         cypher_batch.append((
             f"""
-            MATCH (src:Entity {{name: $src_name, label: $src_label}})
-            MATCH (tgt:Entity {{name: $tgt_name, label: $tgt_label}})
+            MATCH (src:Entity {{name: $src_name}})
+            MATCH (tgt:Entity {{name: $tgt_name}})
             MERGE (src)-[:{rel_type}]->(tgt)
             """,
             {
-                "src_name": rref.head.name, "src_label": rref.head.label,
-                "tgt_name": rref.tail.name, "tgt_label": rref.tail.label,
+                "src_name": rref.head.name,
+                "tgt_name": rref.tail.name,
             },
         ))
 
