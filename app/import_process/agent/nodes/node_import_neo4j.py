@@ -367,54 +367,53 @@ def step_4_build_cypher(
     task_id = state.get("task_id", "")
     global_item_name = state.get("item_name", "")
 
-    # ---- 第一遍：收集所有实体，构建 name→EntityRef 映射 ----
+    # ---- 第一遍：跨 chunk 去重实体，构建 name→EntityRef 映射 ----
+    # 注：step_2 已保证实体 name 非空、label 白名单化、chunk 内去重；
+    #     此处只需做跨 chunk 去重（同名实体首次 label 优先）
     all_entities: Set[EntityRef] = set()
     name_to_entity: Dict[str, EntityRef] = {}  # name → EntityRef（首遇优先）
 
     for chunk_id, entities, relations in extraction_results:
         for ent in entities:
-            name = str(ent.get("name", "")).strip()
-            label = str(ent.get("label", "其他")).strip()
-            if name:
-                eref = EntityRef(name=name, label=label)
-                all_entities.add(eref)
-                # 同名实体只保留首次遇到的 label（避免同一 name 有多个 label 时冲突）
-                if name not in name_to_entity:
-                    name_to_entity[name] = eref
+            name = ent["name"]  # step_2 已保证非空
+            label = ent.get("label", "其他")
+            eref = EntityRef(name=name, label=label)
+            all_entities.add(eref)
+            if name not in name_to_entity:
+                name_to_entity[name] = eref
 
     # ---- 第二遍：收集 Chunk-Entity 关联 + 关系 ----
+    # 注：step_2 已保证关系 head/tail 非空且非孤儿；此处只需校验关系类型白名单
     chunk_entity_pairs: Set[Tuple[str, EntityRef]] = set()
     all_relations: Set[RelationRef] = set()
 
     for chunk_id, entities, relations in extraction_results:
         # Chunk-Entity 关联
         for ent in entities:
-            name = str(ent.get("name", "")).strip()
-            if name and name in name_to_entity:
+            name = ent["name"]
+            if name in name_to_entity:
                 chunk_entity_pairs.add((chunk_id, name_to_entity[name]))
 
-        # 关系
+        # 关系：校验类型白名单（step_2 未做此检查）+ 补全关系引用的实体
         for rel in relations:
-            head_name = str(rel.get("head", "")).strip()
-            tail_name = str(rel.get("tail", "")).strip()
-            rel_type = str(rel.get("type", "")).strip().upper()
+            head_name = rel["head"]
+            tail_name = rel["tail"]
+            rel_type = rel["type"].upper()
 
-            if not head_name or not tail_name or not rel_type:
+            if not rel_type:
                 continue
 
-            # 校验关系类型
             if rel_type not in ALLOWED_REL_TYPES:
                 logger.warning(f"未知关系类型 {rel_type}（head={head_name}, tail={tail_name}），已跳过")
                 continue
 
-            # 查找/创建 head 实体
+            # 兜底：关系引用的实体如果不在 entities 列表中，自动补全
             head_ref = name_to_entity.get(head_name)
             if head_ref is None:
                 head_ref = EntityRef(name=head_name, label="其他")
                 all_entities.add(head_ref)
                 name_to_entity[head_name] = head_ref
 
-            # 查找/创建 tail 实体
             tail_ref = name_to_entity.get(tail_name)
             if tail_ref is None:
                 tail_ref = EntityRef(name=tail_name, label="其他")
