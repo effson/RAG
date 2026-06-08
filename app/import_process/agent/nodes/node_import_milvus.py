@@ -92,9 +92,17 @@ def step_4_insert_datas(chunks):
         data=chunks
     )
     insert_count = result.get("insert_count", 0)
-    logger.info(f"插入数据成功! 总条数:{insert_count}")
-    ids = result.get("ids",[])
-    logger.info(f"插入数据主键回显:{ids}")
+    ids = result.get("ids", [])
+    logger.info(f"插入数据成功! 总条数:{insert_count}, 主键回显:{ids}")
+
+    # 将 Milvus 自动生成的 chunk_id 回写到每个 chunk，供后续节点（如 Neo4j 图谱构建）使用
+    if len(ids) == len(chunks):
+        for i, chunk_id in enumerate(ids):
+            chunks[i]["chunk_id"] = chunk_id
+        logger.info(f"已将 {len(ids)} 个 chunk_id 回写到 chunks 中")
+    else:
+        logger.warning(f"ids 数量({len(ids)})与 chunks 数量({len(chunks)})不一致，跳过 chunk_id 回写")
+
     milvus_client.flush(collection_name=milvus_config.chunks_collection)
     logger.info("强制刷盘（Flush）成功，数据已固化至磁盘！")
 
