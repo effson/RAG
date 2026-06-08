@@ -458,8 +458,7 @@ def step_4_build_cypher(
         chunk_item = chunk_item_map.get(chunk_id, global_item_name)
         cypher_batch.append((
             """
-            MERGE (c:Chunk {id: $chunk_id})
-            SET c.item_name = $item_name
+            MERGE (c:Chunk {id: $chunk_id, item_name: $item_name})
             """,
             {"chunk_id": chunk_id, "item_name": chunk_item},
         ))
