@@ -14,8 +14,12 @@ from app.core.load_prompt import load_prompt
 from app.lm.lm_utils import get_llm_client
 from app.clients.neo4j_utils import get_neo4j_driver
 from app.conf.neo4j_conf import get_config as get_neo4j_config
-from app.clients.milvus_utils import get_milvus_client, fetch_chunks_by_chunk_ids
+from app.clients.milvus_utils import (
+    get_milvus_client, fetch_chunks_by_chunk_ids,
+    create_hybrid_search_requests, hybrid_search,
+)
 from app.conf.milvus_config import milvus_config
+from app.lm.embedding_utils import generate_embeddings
 from dotenv import load_dotenv, find_dotenv
 
 load_dotenv(find_dotenv())
@@ -27,6 +31,10 @@ KG_WEIGHT = 1.0
 
 # 实体名最大长度（与导入侧 entity_extraction.prompt 保持一致）
 MAX_ENTITY_NAME_LENGTH = 15
+
+# Milvus 实体名对齐的最低混合检索分数阈值（norm_score 归一化后范围 0~1）
+# 低于此阈值视为未命中，宁缺勿滥
+ENTITY_ALIGN_SCORE_THRESHOLD = 0.70
 
 # 图谱实体类型中文描述（与 entity_recognition.prompt 中的 {allow_entity_labels_cn} 对应）
 ALLOW_ENTITY_LABELS_CN = "Device(设备), Part(部件), Operation(操作), Step(步骤), Warning(警告), Condition(条件), Tool(工具)"
@@ -136,8 +144,108 @@ def _strip_markdown_json(text: str) -> str:
     return text
 
 
-@step_log("step_3_neo4j_graph_search")
-def step_3_neo4j_graph_search(
+@step_log("step_3_align_entities_with_milvus")
+def step_3_align_entities_with_milvus(
+    llm_entities: List[str], item_names: List[str]
+) -> List[str]:
+    """
+    将 LLM 提取的原始实体名与 Milvus ENTITY_NAME_COLLECTION 中已入库的
+    标准实体名做 BGE-M3 混合检索语义对齐。
+
+    设计考量：
+    - LLM 提取的实体名是自然语言描述（如"漏电保护"），图谱中存储的是
+      导入侧从文档原文抽取的标准实体名（如"漏电保护装置"），两者措辞可能不同
+    - 通过 BGE-M3 稠密+稀疏双向量混合检索，在语义空间中找到最接近的标准实体名
+    - item_name 过滤防止跨商品同名实体混淆
+    - 分数阈值过滤低质量对齐：每个实体取 top1，分数低于阈值则丢弃，宁缺勿滥
+
+    降级策略：Milvus 不可用 / embedding 失败 / 检索异常 → 使用 LLM 原始实体名
+
+    :param llm_entities: LLM 提取的原始实体名列表
+    :param item_names: 已确认的商品名列表
+    :return: Milvus 对齐后的标准实体名列表（已去重）
+    """
+    if not llm_entities:
+        return []
+
+    entity_collection = milvus_config.entity_name_collection
+    if not entity_collection:
+        logger.warning("ENTITY_NAME_COLLECTION 未配置，跳过实体对齐，使用 LLM 原始实体名")
+        return llm_entities
+
+    milvus_client = get_milvus_client()
+    if milvus_client is None:
+        logger.warning("Milvus 客户端不可用，跳过实体对齐，使用 LLM 原始实体名")
+        return llm_entities
+
+    # 3a. BGE-M3 批量向量化：一次性将所有 LLM 实体名转为 dense + sparse 向量
+    #     与导入侧 node_import_neo4j 使用同一个 BGE-M3 模型，向量空间一致
+    try:
+        embeddings = generate_embeddings(llm_entities)
+    except Exception as e:
+        logger.warning(f"实体名向量化失败: {e}，使用 LLM 原始实体名")
+        return llm_entities
+
+    # 3b. 逐实体混合检索：dense(0.9) + sparse(0.1)，top1 + 阈值过滤
+    expr_str = f"item_name in {item_names}"
+    aligned: List[str] = []
+    skipped = 0
+
+    for i, llm_name in enumerate(llm_entities):
+        dense_vector = embeddings["dense"][i]
+        sparse_vector = embeddings["sparse"][i]
+
+        try:
+            reqs = create_hybrid_search_requests(
+                dense_vector, sparse_vector, expr=expr_str, limit=1,
+            )
+            resp = hybrid_search(
+                client=milvus_client,
+                collection_name=entity_collection,
+                reqs=reqs,
+                ranker_weights=(0.8, 0.2),
+                norm_score=True,
+                limit=1,
+                output_fields=["entity_name"],
+            )
+        except Exception as e:
+            logger.warning(f"实体 '{llm_name}' 混合检索异常: {e}，回退使用原始名")
+            aligned.append(llm_name)
+            continue
+
+        # 解析 top1 结果并校验阈值
+        if resp and len(resp) > 0 and len(resp[0]) > 0:
+            top1 = resp[0][0]
+            score = top1.get("distance", 0)
+            matched_name = top1.get("entity", {}).get("entity_name", "")
+
+            if score >= ENTITY_ALIGN_SCORE_THRESHOLD and matched_name:
+                logger.debug(f"实体对齐 ✓: '{llm_name}' → '{matched_name}' (score={score:.4f})")
+                aligned.append(matched_name)
+            else:
+                logger.debug(f"实体对齐 ✗: '{llm_name}' 最高分 {score:.4f} 低于阈值 {ENTITY_ALIGN_SCORE_THRESHOLD}")
+                skipped += 1
+        else:
+            logger.debug(f"实体对齐 ✗: '{llm_name}' 无匹配结果")
+            skipped += 1
+
+    # 去重：多个 LLM 实体可能对齐到同一个标准实体名
+    seen: set = set()
+    deduped: List[str] = []
+    for name in aligned:
+        if name not in seen:
+            seen.add(name)
+            deduped.append(name)
+
+    logger.info(
+        f"KG检索 - 实体对齐: {len(llm_entities)} 个 LLM 实体 "
+        f"→ {len(deduped)} 个标准实体名（跳过 {skipped} 个低分/无匹配）"
+    )
+    return deduped
+
+
+@step_log("step_4_neo4j_graph_search")
+def step_4_neo4j_graph_search(
     item_names: List[str], keywords: List[str]
 ) -> tuple:
     """
@@ -256,8 +364,8 @@ def step_3_neo4j_graph_search(
     return list(chunk_ids), entity_relations
 
 
-@step_log("step_4_query_chunks_from_milvus")
-def step_4_query_chunks_from_milvus(chunk_ids: List[str]) -> List[Dict]:
+@step_log("step_5_query_chunks_from_milvus")
+def step_5_query_chunks_from_milvus(chunk_ids: List[str]) -> List[Dict]:
     """
     通过 chunk_id 列表从 Milvus 反查切片完整内容（文本、标题等）。
     使用 milvus_utils 中已有的 fetch_chunks_by_chunk_ids 工具函数。
@@ -288,8 +396,8 @@ def step_4_query_chunks_from_milvus(chunk_ids: List[str]) -> List[Dict]:
     return chunks
 
 
-@step_log("step_5_format_for_rrf")
-def step_5_format_for_rrf(
+@step_log("step_6_format_for_rrf")
+def step_6_format_for_rrf(
     chunks: List[Dict], entity_relations: List[Dict]
 ) -> List[Dict]:
     """
@@ -330,12 +438,13 @@ def node_search_kg(state: QueryGraphState) -> dict:
     KG 检索通过实体名精确匹配 + 关系遍历，能找到显式关联的切片。
 
     内部流程：
-        1. 参数校验（item_names / rewritten_query）
+        1. 参数校验 + 剥离商品名
         2. LLM 提取查询中的关键实体术语（部件名、操作名等）
-        3. Neo4j 图搜索：实体 CONTAINS 匹配 → MENTIONED_IN → 切片 ID
+        3. Milvus 实体名向量对齐（BGE-M3 混合检索 → 映射到图谱标准实体名）
+        4. Neo4j 图搜索：标准实体名 CONTAINS 匹配 → MENTIONED_IN → 切片 ID
            + 1-hop 关系扩展获取关联实体的切片
-        4. Milvus 反查切片完整内容（通过 fetch_chunks_by_chunk_ids）
-        5. 格式化为 RRF 兼容格式
+        5. Milvus 反查切片完整内容（通过 fetch_chunks_by_chunk_ids）
+        6. 格式化为 RRF 兼容格式
 
     产出：
         - state["kg_chunks"]: KG 召回的切片列表（参与 RRF 融合）
@@ -353,16 +462,19 @@ def node_search_kg(state: QueryGraphState) -> dict:
     item_names, cleaned_query = step_1_data_validates(state)
 
     # Step 2: LLM 提取关键实体术语（基于剥离商品名后的纯问题）
-    keywords = step_2_extract_keywords(cleaned_query)
+    raw_entities = step_2_extract_keywords(cleaned_query)
 
-    # Step 3: Neo4j 图搜索 → chunk_id 列表 + 实体关系
-    chunk_ids, entity_relations = step_3_neo4j_graph_search(item_names, keywords)
+    # Step 3: Milvus 实体名向量对齐 → 映射到图谱中的标准实体名
+    aligned_entities = step_3_align_entities_with_milvus(raw_entities, item_names)
 
-    # Step 4: Milvus 反查切片内容
-    chunks = step_4_query_chunks_from_milvus(chunk_ids)
+    # Step 4: Neo4j 图搜索 → chunk_id 列表 + 实体关系
+    chunk_ids, entity_relations = step_4_neo4j_graph_search(item_names, aligned_entities)
 
-    # Step 5: 格式化为 RRF 兼容
-    kg_chunks = step_5_format_for_rrf(chunks, entity_relations)
+    # Step 5: Milvus 反查切片内容
+    chunks = step_5_query_chunks_from_milvus(chunk_ids)
+
+    # Step 6: 格式化为 RRF 兼容
+    kg_chunks = step_6_format_for_rrf(chunks, entity_relations)
 
     # 任务结束
     add_done_task(state["session_id"], sys._getframe().f_code.co_name, state.get("is_stream"))
