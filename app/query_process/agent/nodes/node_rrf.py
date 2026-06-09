@@ -7,6 +7,7 @@ from app.core.logger import logger, node_log, step_log
 
 EMBED_WEIGHT = 1.0
 HYDE_WEIGHT = 1.0
+KG_WEIGHT = 1.0
 
 @step_log("step_1_data_validates")
 def step_1_data_validates(state):
@@ -17,7 +18,8 @@ def step_1_data_validates(state):
     """
     embedding_chunks = state.get("embedding_chunks", [])
     hyde_embedding_chunks = state.get("hyde_embedding_chunks", [])
-    return embedding_chunks, hyde_embedding_chunks
+    kg_chunks = state.get("kg_chunks", [])
+    return embedding_chunks, hyde_embedding_chunks, kg_chunks
 
 @step_log("step_2_rrf_list")
 def step_2_rrf_list(param_list, k: int = 60, top: int = 5):
@@ -74,13 +76,14 @@ def node_rrf(state):
     # 日志+任务
     add_running_task(state["session_id"], sys._getframe().f_code.co_name, state.get("is_stream"))
 
-    # 1. 参数获取和校验 embedding_chunks hyde_embedding_chunks  get("key",[])
-    embedding_chunks, hyde_embedding_chunks = step_1_data_validates(state)
+    # 1. 参数获取和校验 embedding_chunks hyde_embedding_chunks kg_chunks
+    embedding_chunks, hyde_embedding_chunks, kg_chunks = step_1_data_validates(state)
 
-    # 2. 处理集合参数 [(embedding_chunks,1.0),(hyde_embedding_chunks,1.0)]  -> param_list
+    # 2. 处理集合参数 [(embedding_chunks,1.0),(hyde_embedding_chunks,1.0),(kg_chunks,1.0)]  -> param_list
     param_list = [
         (embedding_chunks, EMBED_WEIGHT),
-        (hyde_embedding_chunks, HYDE_WEIGHT)
+        (hyde_embedding_chunks, HYDE_WEIGHT),
+        (kg_chunks, KG_WEIGHT),
     ]
 
     entity_list = step_2_rrf_list(param_list)

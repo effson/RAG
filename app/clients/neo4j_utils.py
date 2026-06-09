@@ -5,7 +5,7 @@ from app.core.logger import logger
 
 _neo4j_driver = None
 
-def get_neo4j_driver() -> GraphDatabase:
+def get_neo4j_driver():
     """
     获取 Neo4j 驱动实例（单例模式）
     """
