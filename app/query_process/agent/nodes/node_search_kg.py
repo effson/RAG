@@ -1,13 +1,16 @@
 # KG（知识图谱）检索节点：利用 Neo4j 中的实体关系图，通过实体名匹配和图遍历定位相关切片
+import re
 import sys
 from typing import List, Dict, Any, Optional
 
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_core.output_parsers import JsonOutputParser
+from langchain_core.runnables import RunnableLambda
 
 from app.query_process.agent.state import QueryGraphState
 from app.utils.task_utils import add_running_task, add_done_task
 from app.core.logger import logger, node_log, step_log
+from app.core.load_prompt import load_prompt
 from app.lm.lm_utils import get_llm_client
 from app.clients.neo4j_utils import get_neo4j_driver
 from app.conf.neo4j_conf import get_config as get_neo4j_config
@@ -19,62 +22,118 @@ load_dotenv(find_dotenv())
 
 
 # ---- 配置常量 ----
-# KG 路在 RRF 融合时的权重（与其他路平权）
+# KG 路在 RRF 融合时的权重
 KG_WEIGHT = 1.0
+
+# 实体名最大长度（与导入侧 entity_extraction.prompt 保持一致）
+MAX_ENTITY_NAME_LENGTH = 15
+
+# 图谱实体类型中文描述（与 entity_recognition.prompt 中的 {allow_entity_labels_cn} 对应）
+ALLOW_ENTITY_LABELS_CN = "Device(设备), Part(部件), Operation(操作), Step(步骤), Warning(警告), Condition(条件), Tool(工具)"
 
 
 @step_log("step_1_data_validates")
 def step_1_data_validates(state: QueryGraphState):
     """
-    获取参数并且校验
-    :param state:
-    :return: item_names, rewritten_query
+    参数校验 + 从 rewritten_query 中剔除已确认的商品名。
+
+    设计考量：
+    - 导入侧切片文档中通常不包含设备主语，图谱里也没有把商品名作为 Entity 节点
+    - item_name 过滤已在后续 Milvus expr 和 Neo4j Cypher WHERE 子句中生效
+    - 提前剥离商品名可避免后续 LLM 提取出无用的品牌/型号关键词
+
+    :param state: 图状态
+    :return: (item_names, cleaned_query)
     """
     item_names = state.get("item_names")
     rewritten_query = state.get("rewritten_query")
     if not item_names or not rewritten_query:
         logger.error("item_names或rewritten_query不存在,无法继续KG检索!")
         raise ValueError("item_names或rewritten_query不存在,无法继续KG检索!")
-    return item_names, rewritten_query
+
+    # 从问题文本中移除商品名：按长度降序替换，避免短名截断长名
+    cleaned = rewritten_query
+    for name in sorted(item_names, key=len, reverse=True):
+        cleaned = cleaned.replace(name, "")
+    # 清理替换后产生的多余空白
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+    logger.info(f"KG检索 - 剥离商品名: '{rewritten_query}' → '{cleaned}'")
+    return item_names, cleaned
 
 
 @step_log("step_2_extract_keywords")
-def step_2_extract_keywords(rewritten_query: str) -> List[str]:
+def step_2_extract_keywords(cleaned_query: str) -> List[str]:
     """
-    调用 LLM 从用户改写问题中提取关键实体/部件/操作术语。
-    这些关键词用于在 Neo4j 中做实体名 CONTAINS 匹配。
+    调用 LLM 从剥离商品名的问题中提取实体名，用于 Neo4j 实体 CONTAINS 匹配。
 
-    注意：只提取具体的技术术语（部件名、操作名、参数名等），
-    不提取设备名或泛泛的疑问词。
+    清洗流程（与导入侧 entity_extraction 对齐）：
+        1. 加载外部 prompt 模板 (entity_recognition.prompt)
+        2. LLM (JSON mode) 提取实体名
+        3. _strip_markdown_json: 去除可能的 Markdown 围栏
+        4. JSON 反序列化 → 取 entities 数组
+        5. 实体名截断至 {MAX_ENTITY_NAME_LENGTH} 字符
+        6. 去重
 
-    :param rewritten_query: 改写后的问题
-    :return: 关键词列表，提取失败返回空列表
+    降级策略：LLM 调用或 JSON 解析失败 → 返回空列表，不阻断主流程
+
+    :param cleaned_query: 已剥离商品名的问题文本
+    :return: 清洗后的实体名列表
     """
     llm = get_llm_client(json_mode=True)
     parser = JsonOutputParser()
 
-    prompt = (
-        f"从以下用户问题中提取关键实体/部件/操作术语（设备名和产品名除外）。\n"
-        f"只提取具体的技术术语，如部件名、操作名、参数名、功能名等。最多提取 5 个。\n\n"
-        f"用户问题: {rewritten_query}\n\n"
-        f'请以 JSON 格式返回: {{"keywords": ["术语1", "术语2", ...]}}\n'
-        f'如果提取不到任何术语，返回: {{"keywords": []}}'
+    # 从外部 prompt 模板加载提示词
+    prompt = load_prompt(
+        "entity_recognition",
+        allow_entity_labels_cn=ALLOW_ENTITY_LABELS_CN,
+        MAX_ENTITY_NAME_LENGTH=str(MAX_ENTITY_NAME_LENGTH),
+        query=cleaned_query,
     )
 
     messages = [
-        SystemMessage(content="你是一个专业的技术术语提取助手，擅长从用户问题中识别关键实体和部件名称。"),
+        SystemMessage(content="你是知识图谱系统的实体识别领域专家，擅长从用户问题中提取可用于图谱查询的实体名称。"),
         HumanMessage(content=prompt),
     ]
 
     try:
-        chain = llm | parser
+        # LLM → 提取 content → 清洗 Markdown 围栏 → JSON 解析
+        chain = llm | RunnableLambda(lambda x: x.content) | RunnableLambda(_strip_markdown_json) | parser
         result = chain.invoke(messages)
-        keywords = result.get("keywords", []) if isinstance(result, dict) else []
-        logger.info(f"KG检索 - 提取到关键词: {keywords}")
-        return keywords
+        raw_entities = result.get("entities", []) if isinstance(result, dict) else []
     except Exception as e:
-        logger.warning(f"KG检索 - 关键词提取失败: {e}，将使用空关键词列表回退")
+        logger.warning(f"KG检索 - 实体名提取失败: {e}，返回空列表")
         return []
+
+    # 清洗：截断 + 去重
+    seen: set = set()
+    cleaned: List[str] = []
+    for name in raw_entities:
+        if not isinstance(name, str):
+            continue
+        name = name.strip()
+        if not name:
+            continue
+        if len(name) > MAX_ENTITY_NAME_LENGTH:
+            name = name[:MAX_ENTITY_NAME_LENGTH] + "..."
+        if name not in seen:
+            seen.add(name)
+            cleaned.append(name)
+
+    logger.info(f"KG检索 - 提取到实体名: {cleaned}")
+    return cleaned
+
+
+def _strip_markdown_json(text: str) -> str:
+    """
+    去除 LLM 输出中可能包裹的 Markdown 代码块标记（```json ... ```），
+    提取纯净的 JSON 字符串。与 node_import_neo4j 中同名函数逻辑一致。
+    """
+    text = text.strip()
+    m = re.match(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL)
+    if m:
+        logger.debug("KG检索 - 检测到 Markdown 代码块包裹，已自动去除")
+        return m.group(1).strip()
+    return text
 
 
 @step_log("step_3_neo4j_graph_search")
@@ -290,11 +349,11 @@ def node_search_kg(state: QueryGraphState) -> dict:
     # 任务开始
     add_running_task(state["session_id"], sys._getframe().f_code.co_name, state.get("is_stream"))
 
-    # Step 1: 参数校验
-    item_names, rewritten_query = step_1_data_validates(state)
+    # Step 1: 参数校验 + 剥离商品名
+    item_names, cleaned_query = step_1_data_validates(state)
 
-    # Step 2: LLM 提取关键实体术语
-    keywords = step_2_extract_keywords(rewritten_query)
+    # Step 2: LLM 提取关键实体术语（基于剥离商品名后的纯问题）
+    keywords = step_2_extract_keywords(cleaned_query)
 
     # Step 3: Neo4j 图搜索 → chunk_id 列表 + 实体关系
     chunk_ids, entity_relations = step_3_neo4j_graph_search(item_names, keywords)
