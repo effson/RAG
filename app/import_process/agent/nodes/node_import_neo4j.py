@@ -53,6 +53,7 @@ class EntityRef:
     """去重用的实体引用，以(name, label)为唯一标识"""
     name: str
     label: str
+    description: str = ""
 
     def __hash__(self):
         return hash((self.name.strip(), self.label.strip()))
@@ -358,43 +359,49 @@ def step_4_build_cypher(
     """
     对提取结果做跨 chunk 去重，构建 Cypher MERGE 语句列表。
 
-    :param state: 图状态（获取 file_title / task_id / item_name）
+    实体以 name + item_name 为标识，同名实体合并标签（Neo4j 多标签）
+    和 description（拼接），实现查询收敛。
+
+    :param state: 图状态
     :param extraction_results: step_2 的提取结果
-    :param stats: 处理统计（会更新 total_entities / total_relations）
+    :param stats: 处理统计
     :return: cypher_batch: [(cypher_statement, params_dict), ...]
     """
-    file_title = state.get("file_title", "")
-    task_id = state.get("task_id", "")
     global_item_name = state.get("item_name", "")
 
-    # ---- 第一遍：跨 chunk 去重实体，构建 name→EntityRef 映射 ----
-    # 注：step_2 已保证实体 name 非空、label 白名单化、chunk 内去重；
-    #     此处只需做跨 chunk 去重（同名实体首次 label 优先）
-    all_entities: Set[EntityRef] = set()
-    name_to_entity: Dict[str, EntityRef] = {}  # name → EntityRef（首遇优先）
+    # ---- 第一遍：按 name 聚合实体的 labels / descriptions / source_chunk_id ----
+    # step_2 已保证 name 非空、label 白名单化、chunk 内去重；
+    # 此处跨 chunk 聚合同名实体，收集所有 label 和 description
+    name_to_labels: Dict[str, Set[str]] = {}
+    name_to_descs: Dict[str, List[str]] = {}
+    name_to_source_chunk: Dict[str, str] = {}
+    all_entity_names: Set[str] = set()
 
     for chunk_id, entities, relations in extraction_results:
-        for ent in entities:
-            name = ent["name"]  # step_2 已保证非空
-            label = ent.get("label", "其他")
-            eref = EntityRef(name=name, label=label)
-            all_entities.add(eref)
-            if name not in name_to_entity:
-                name_to_entity[name] = eref
-
-    # ---- 第二遍：收集 Chunk-Entity 关联 + 关系 ----
-    # 注：step_2 已保证关系 head/tail 非空且非孤儿；此处只需校验关系类型白名单
-    chunk_entity_pairs: Set[Tuple[str, EntityRef]] = set()
-    all_relations: Set[RelationRef] = set()
-
-    for chunk_id, entities, relations in extraction_results:
-        # Chunk-Entity 关联
         for ent in entities:
             name = ent["name"]
-            if name in name_to_entity:
-                chunk_entity_pairs.add((chunk_id, name_to_entity[name]))
+            label = ent.get("label", "其他")
+            desc = ent.get("description", "")
 
-        # 关系：校验类型白名单（step_2 未做此检查）+ 补全关系引用的实体
+            all_entity_names.add(name)
+            if name not in name_to_labels:
+                name_to_labels[name] = set()
+                name_to_descs[name] = []
+                name_to_source_chunk[name] = chunk_id
+            name_to_labels[name].add(label)
+            if desc and desc not in name_to_descs[name]:
+                name_to_descs[name].append(desc)
+
+    # ---- 第二遍：收集 Chunk-Entity 关联 + 关系 ----
+    chunk_entity_pairs: Set[Tuple[str, str]] = set()  # (chunk_id, entity_name)
+    all_relations: Set[Tuple[str, str, str]] = set()  # (head, tail, rel_type)
+
+    for chunk_id, entities, relations in extraction_results:
+        for ent in entities:
+            name = ent["name"]
+            if name in name_to_labels:
+                chunk_entity_pairs.add((chunk_id, name))
+
         for rel in relations:
             head_name = rel["head"]
             tail_name = rel["tail"]
@@ -402,30 +409,24 @@ def step_4_build_cypher(
 
             if not rel_type:
                 continue
-
             if rel_type not in ALLOWED_REL_TYPES:
                 logger.warning(f"未知关系类型 {rel_type}（head={head_name}, tail={tail_name}），已跳过")
                 continue
 
             # 兜底：关系引用的实体如果不在 entities 列表中，自动补全
-            head_ref = name_to_entity.get(head_name)
-            if head_ref is None:
-                head_ref = EntityRef(name=head_name, label="其他")
-                all_entities.add(head_ref)
-                name_to_entity[head_name] = head_ref
+            for n in (head_name, tail_name):
+                if n not in name_to_labels:
+                    name_to_labels[n] = {"其他"}
+                    name_to_descs[n] = []
+                    name_to_source_chunk[n] = chunk_id
+                    all_entity_names.add(n)
 
-            tail_ref = name_to_entity.get(tail_name)
-            if tail_ref is None:
-                tail_ref = EntityRef(name=tail_name, label="其他")
-                all_entities.add(tail_ref)
-                name_to_entity[tail_name] = tail_ref
+            all_relations.add((head_name, tail_name, rel_type))
 
-            all_relations.add(RelationRef(head=head_ref, tail=tail_ref, rel_type=rel_type))
-
-    stats.total_entities = len(all_entities)
+    stats.total_entities = len(name_to_labels)
     stats.total_relations = len(all_relations)
     logger.info(
-        f"去重完成: {stats.total_entities} 唯一实体 / {stats.total_relations} 唯一关系, "
+        f"聚合完成: {stats.total_entities} 唯一实体（跨 chunk 合并） / {stats.total_relations} 唯一关系, "
         f"{len(chunk_entity_pairs)} 条 Chunk-Entity 关联"
     )
 
@@ -433,7 +434,7 @@ def step_4_build_cypher(
 
     cypher_batch: List[Tuple[str, Dict[str, Any]]] = []
 
-    # 0. 清理旧数据：删除所有带此 item_name 的节点及其关系
+    # 0. 清理旧数据
     if global_item_name:
         cypher_batch.append((
             """
@@ -443,18 +444,35 @@ def step_4_build_cypher(
             {"item_name": global_item_name},
         ))
 
-    # 1. 实体节点（仅以 name 为唯一标识）
-    for eref in all_entities:
+    # 1. 实体节点
+    # label → Neo4j 节点标签（:Entity:DEVICE:PART ...），同名实体合并标签和 description
+    for name in sorted(all_entity_names):
+        labels = name_to_labels.get(name, {"其他"})
+        extra_labels = "".join(f":{l}" for l in sorted(labels))
+        descs = name_to_descs.get(name, [])
+        desc_merged = "; ".join(descs) if descs else ""
+        source_chunk = name_to_source_chunk.get(name, "")
+
         cypher_batch.append((
-            """
-            MERGE (e:Entity {name: $name})
+            f"""
+            MERGE (e:Entity {{name: $name, item_name: $item_name}})
+            ON CREATE SET e.source_chunk_id = $source_chunk_id, e.description = $description
+            ON MATCH SET e.description = CASE
+                WHEN $description = '' THEN e.description
+                WHEN e.description IS NULL THEN $description
+                WHEN e.description CONTAINS $description THEN e.description
+                ELSE e.description + '; ' + $description
+            END
+            SET e{extra_labels}
             """,
-            {"name": eref.name},
+            {
+                "name": name, "item_name": global_item_name,
+                "source_chunk_id": source_chunk, "description": desc_merged,
+            },
         ))
 
-    # 2. Chunk 节点（id + item_name，不再挂载到 Document）
+    # 2. Chunk 节点
     seen_chunk_ids: Set[str] = set()
-    # chunk_id → item_name 快速查找表
     chunk_item_map: Dict[str, str] = {}
     for ch in state.get("chunks", []):
         cid = str(ch.get("chunk_id", ""))
@@ -473,29 +491,28 @@ def step_4_build_cypher(
             {"chunk_id": chunk_id, "item_name": chunk_item},
         ))
 
-    # 3. Entity-Chunk 提及关系（实体被提及于哪个 Chunk）
-    for chunk_id, eref in chunk_entity_pairs:
+    # 3. Entity-Chunk 提及关系
+    for chunk_id, name in chunk_entity_pairs:
         cypher_batch.append((
             """
-            MATCH (e:Entity {name: $name})
+            MATCH (e:Entity {name: $name, item_name: $item_name})
             MATCH (c:Chunk {id: $chunk_id})
             MERGE (e)-[:MENTIONED_IN]->(c)
             """,
-            {"chunk_id": chunk_id, "name": eref.name},
+            {"chunk_id": chunk_id, "name": name, "item_name": global_item_name},
         ))
 
-    # 4. 实体间关系（使用 LLM 指定的关系类型作为 Neo4j 关系 Type）
-    for rref in all_relations:
-        rel_type = rref.rel_type  # 已通过白名单校验，可直接用于 Cypher
+    # 4. 实体间关系
+    for head_name, tail_name, rel_type in all_relations:
         cypher_batch.append((
             f"""
-            MATCH (src:Entity {{name: $src_name}})
-            MATCH (tgt:Entity {{name: $tgt_name}})
+            MATCH (src:Entity {{name: $src_name, item_name: $item_name}})
+            MATCH (tgt:Entity {{name: $tgt_name, item_name: $item_name}})
             MERGE (src)-[:{rel_type}]->(tgt)
             """,
             {
-                "src_name": rref.head.name,
-                "tgt_name": rref.tail.name,
+                "src_name": head_name, "tgt_name": tail_name,
+                "item_name": global_item_name,
             },
         ))
 
@@ -698,7 +715,8 @@ def node_import_neo4j(state: ImportGraphState) -> ImportGraphState:
       - state["item_name"] / state["file_title"] / state["task_id"]
 
     产出：
-      - Neo4j 中的 Document / ItemName / Chunk / Entity 节点及关系
+      - Neo4j 中的 Chunk 节点 + 多标签 Entity 节点（:Entity:DEVICE:...）
+        及 MENTIONED_IN / 8种实体间关系
       - Milvus 实体名称集合中的实体稠密+稀疏向量（可按实体名做混合检索）
       - state["kg_id"] / state["kg_stats"]
     """
@@ -746,7 +764,7 @@ if __name__ == "__main__":
         "chunks": [
             {
                 "chunk_id": 1001,
-                "content": "烫金机HAK 180适用于多种材料的烫金加工，包括纸张、皮革、塑料等。设备采用微电脑控制系统，具备自动温控功能。",
+                "content": "烫金机HAK 180适用于多种材料的烫金加工，包括纸张、皮革、塑料等。设备采用微电脑控制系统，具备自动温控功能。配备漏电保护装置，检测到漏电电流超过一定数值时自动断电。",
                 "title": "# 产品概述",
                 "file_title": "HAK180产品安全手册",
                 "item_name": "HAK 180 烫金机",
