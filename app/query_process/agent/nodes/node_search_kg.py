@@ -1,7 +1,7 @@
 # KG（知识图谱）检索节点：利用 Neo4j 中的实体关系图，通过实体名匹配和图遍历定位相关切片
 import re
 import sys
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_core.output_parsers import JsonOutputParser
@@ -34,7 +34,7 @@ MAX_ENTITY_NAME_LENGTH = 15
 
 # Milvus 实体名对齐的最低混合检索分数阈值（norm_score 归一化后范围 0~1）
 # 低于此阈值视为未命中，宁缺勿滥
-ENTITY_ALIGN_SCORE_THRESHOLD = 0.70
+ENTITY_ALIGN_SCORE_THRESHOLD = 0.50
 
 # 图谱实体类型中文描述（与 entity_recognition.prompt 中的 {allow_entity_labels_cn} 对应）
 ALLOW_ENTITY_LABELS_CN = "Device(设备), Part(部件), Operation(操作), Step(步骤), Warning(警告), Condition(条件), Tool(工具)"
@@ -144,120 +144,160 @@ def _strip_markdown_json(text: str) -> str:
     return text
 
 
+def _dedup_entity_pairs(pairs: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
+    """去重：(entity_name, item_name) 都相同的视为重复。"""
+    seen: set = set()
+    result: List[Tuple[str, str]] = []
+    for pair in pairs:
+        if pair not in seen:
+            seen.add(pair)
+            result.append(pair)
+    return result
+
+
 @step_log("step_3_align_entities_with_milvus")
 def step_3_align_entities_with_milvus(
     llm_entities: List[str], item_names: List[str]
-) -> List[str]:
+) -> List[Tuple[str, str]]:
     """
     将 LLM 提取的原始实体名与 Milvus ENTITY_NAME_COLLECTION 中已入库的
     标准实体名做 BGE-M3 混合检索语义对齐。
+
+    算法（逐 item_name 检索）：
+        对每个 item_name，以该 item_name 为过滤条件，对所有 llm_entity 逐一
+        做 BGE-M3 混合检索取 top1：
+          - 分数 >= ENTITY_ALIGN_SCORE_THRESHOLD → 采用 Milvus 标准实体名
+          - 分数不足 / item_name 不匹配 / 无结果 / 异常 → 回退使用 LLM 原始实体名
+        最终每个对齐结果都是一个 (entity_name, item_name) 对。
 
     设计考量：
     - LLM 提取的实体名是自然语言描述（如"漏电保护"），图谱中存储的是
       导入侧从文档原文抽取的标准实体名（如"漏电保护装置"），两者措辞可能不同
     - 通过 BGE-M3 稠密+稀疏双向量混合检索，在语义空间中找到最接近的标准实体名
-    - item_name 过滤防止跨商品同名实体混淆
-    - 分数阈值过滤低质量对齐：每个实体取 top1，分数低于阈值则丢弃，宁缺勿滥
+    - 按 item_name 分别检索，确保每个实体的 item_name 归属明确
+    - 分数阈值过滤低质量对齐，未达标者以 LLM 原始名兜底（宁滥勿缺，给 Neo4j CONTAINS 匹配留机会）
 
-    降级策略：Milvus 不可用 / embedding 失败 / 检索异常 → 使用 LLM 原始实体名
+    降级策略：Milvus 不可用 / embedding 失败 → 返回 LLM 实体 × item_names 笛卡尔积
 
     :param llm_entities: LLM 提取的原始实体名列表
     :param item_names: 已确认的商品名列表
-    :return: Milvus 对齐后的标准实体名列表（已去重）
+    :return: 已去重的 (entity_name, item_name) 对列表
     """
     if not llm_entities:
         return []
 
     entity_collection = milvus_config.entity_name_collection
-    if not entity_collection:
-        logger.warning("ENTITY_NAME_COLLECTION 未配置，跳过实体对齐，使用 LLM 原始实体名")
-        return llm_entities
-
     milvus_client = get_milvus_client()
-    if milvus_client is None:
-        logger.warning("Milvus 客户端不可用，跳过实体对齐，使用 LLM 原始实体名")
-        return llm_entities
+
+    # 降级：Milvus 不可用 → LLM 实体 × item_names 笛卡尔积
+    if not entity_collection or milvus_client is None:
+        logger.warning("Milvus 不可用，使用 LLM 原始实体 × item_names 笛卡尔积")
+        pairs: List[Tuple[str, str]] = []
+        for iname in item_names:
+            for ent in llm_entities:
+                pairs.append((ent, iname))
+        return _dedup_entity_pairs(pairs)
 
     # 3a. BGE-M3 批量向量化：一次性将所有 LLM 实体名转为 dense + sparse 向量
     #     与导入侧 node_import_neo4j 使用同一个 BGE-M3 模型，向量空间一致
     try:
         embeddings = generate_embeddings(llm_entities)
     except Exception as e:
-        logger.warning(f"实体名向量化失败: {e}，使用 LLM 原始实体名")
-        return llm_entities
+        logger.warning(f"实体名向量化失败: {e}，使用 LLM 原始实体 × item_names 笛卡尔积")
+        pairs: List[Tuple[str, str]] = []
+        for iname in item_names:
+            for ent in llm_entities:
+                pairs.append((ent, iname))
+        return _dedup_entity_pairs(pairs)
 
-    # 3b. 逐实体混合检索：dense(0.4) + sparse(0.6)，top1 + 阈值过滤
-    expr_str = f"item_name in {item_names}"
-    aligned: List[str] = []
+    # 3b. 逐 item_name 检索：每个 item_name 独立过滤，确保实体归属明确
+    aligned: List[Tuple[str, str]] = []  # (entity_name, item_name)
     skipped = 0
 
-    for i, llm_name in enumerate(llm_entities):
-        dense_vector = embeddings["dense"][i]
-        sparse_vector = embeddings["sparse"][i]
+    for item_name in item_names:
+        expr_str = f'item_name == "{item_name}"'
 
-        try:
-            reqs = create_hybrid_search_requests(
-                dense_vector, sparse_vector, expr=expr_str, limit=1,
-            )
-            resp = hybrid_search(
-                client=milvus_client,
-                collection_name=entity_collection,
-                reqs=reqs,
-                ranker_weights=(0.4, 0.6),
-                norm_score=True,
-                limit=1,
-                output_fields=["entity_name"],
-            )
-        except Exception as e:
-            logger.warning(f"实体 '{llm_name}' 混合检索异常: {e}，回退使用原始名")
-            aligned.append(llm_name)
-            continue
+        for i, llm_name in enumerate(llm_entities):
+            dense_vector = embeddings["dense"][i]
+            sparse_vector = embeddings["sparse"][i]
 
-        # 解析 top1 结果并校验阈值
-        if resp and len(resp) > 0 and len(resp[0]) > 0:
-            top1 = resp[0][0]
-            score = top1.get("distance", 0)
-            matched_name = top1.get("entity", {}).get("entity_name", "")
+            try:
+                reqs = create_hybrid_search_requests(
+                    dense_vector, sparse_vector, expr=expr_str, limit=1,
+                )
+                resp = hybrid_search(
+                    client=milvus_client,
+                    collection_name=entity_collection,
+                    reqs=reqs,
+                    ranker_weights=(0.4, 0.6),
+                    norm_score=True,
+                    limit=1,
+                    output_fields=["entity_name", "item_name"],
+                )
+            except Exception as e:
+                logger.warning(
+                    f"实体 '{llm_name}' (item={item_name}) 检索异常: {e}，回退使用 LLM 原始名"
+                )
+                aligned.append((llm_name, item_name))
+                continue
 
-            if score >= ENTITY_ALIGN_SCORE_THRESHOLD and matched_name:
-                logger.debug(f"实体对齐 ✓: '{llm_name}' → '{matched_name}' (score={score:.4f})")
-                aligned.append(matched_name)
+            # 解析 top1 结果并校验：分数 + 实体名 + item_name 三重门
+            if resp and len(resp) > 0 and len(resp[0]) > 0:
+                top1 = resp[0][0]
+                score = top1.get("distance", 0)
+                entity = top1.get("entity", {})
+                matched_name = entity.get("entity_name", "")
+                matched_item_name = entity.get("item_name", "")
+
+                if (
+                    score >= ENTITY_ALIGN_SCORE_THRESHOLD
+                    and matched_name
+                    and matched_item_name == item_name
+                ):
+                    logger.debug(
+                        f"实体对齐 ✓: '{llm_name}' → '{matched_name}' "
+                        f"(item={item_name}, score={score:.4f})"
+                    )
+                    aligned.append((matched_name, item_name))
+                else:
+                    logger.debug(
+                        f"实体对齐 ✗: '{llm_name}' (item={item_name}) "
+                        f"score={score:.4f}，回退使用 LLM 原始名"
+                    )
+                    aligned.append((llm_name, item_name))
+                    skipped += 1
             else:
-                logger.debug(f"实体对齐 ✗: '{llm_name}' 最高分 {score:.4f} 低于阈值 {ENTITY_ALIGN_SCORE_THRESHOLD}")
+                logger.debug(
+                    f"实体对齐 ✗: '{llm_name}' (item={item_name}) 无匹配结果，回退使用 LLM 原始名"
+                )
+                aligned.append((llm_name, item_name))
                 skipped += 1
-        else:
-            logger.debug(f"实体对齐 ✗: '{llm_name}' 无匹配结果")
-            skipped += 1
 
-    # 去重：多个 LLM 实体可能对齐到同一个标准实体名
-    seen: set = set()
-    deduped: List[str] = []
-    for name in aligned:
-        if name not in seen:
-            seen.add(name)
-            deduped.append(name)
+    # 3c. 去重：(entity_name, item_name) 都相同才视为重复
+    result = _dedup_entity_pairs(aligned)
 
     logger.info(
-        f"KG检索 - 实体对齐: {len(llm_entities)} 个 LLM 实体 "
-        f"→ {len(deduped)} 个标准实体名（跳过 {skipped} 个低分/无匹配）"
+        f"KG检索 - 实体对齐: {len(llm_entities)} LLM实体 × {len(item_names)} 商品 "
+        f"→ {len(result)} 个 (entity, item_name) 对（跳过 {skipped} 个低分/无匹配）"
     )
-    return deduped
+    return result
 
 
 @step_log("step_4_neo4j_graph_search")
 def step_4_neo4j_graph_search(
-    item_names: List[str], keywords: List[str]
+    entity_item_pairs: List[Tuple[str, str]],
+    item_names: List[str],
 ) -> tuple:
     """
     在 Neo4j 中执行图搜索，通过实体名匹配和图关系遍历定位相关切片。
 
     查询策略（按优先级）：
-    1. 关键词精确匹配实体名 → 沿 MENTIONED_IN 边获取直接提及的切片
+    1. (entity_name, item_name) 对精确匹配 → 沿 MENTIONED_IN 边获取直接提及的切片
     2. 1-hop 关系扩展 → 获取关联实体的切片（如问"漏电保护"也能找到"电源规格"切片）
-    3. 无关键词回退 → 获取该产品下所有实体的切片（保证 KG 路始终有输出）
+    3. 无实体对回退 → 获取该产品下所有实体的切片（保证 KG 路始终有输出）
 
-    :param item_names: 确认的产品名称列表
-    :param keywords: LLM 提取的关键术语列表
+    :param entity_item_pairs: (实体名, 商品名) 对列表，来自 step_3 对齐结果
+    :param item_names: 确认的产品名称列表（entity_item_pairs 为空时的回退用）
     :return: (chunk_ids: List[str], entity_relations: List[Dict])
              chunk_ids 为 Neo4j 中 Chunk 节点的 id（字符串），
              entity_relations 为实体间关系列表 [{source, relation, target}]
@@ -274,55 +314,61 @@ def step_4_neo4j_graph_search(
     entity_relations: List[Dict] = []
 
     with driver.session(database=database) as session:
-        for item_name in item_names:
-            # ---- 策略1 + 策略2：基于关键词的实体匹配 + 1-hop 扩展 ----
-            if keywords:
-                for keyword in keywords:
-                    # 1a. 直接实体 → 切片
-                    try:
-                        direct_result = session.run(
-                            """
-                            MATCH (e:Entity {item_name: $item_name})
-                            WHERE e.name CONTAINS $keyword
-                            MATCH (e)-[:MENTIONED_IN]->(c:Chunk)
-                            RETURN DISTINCT c.id AS chunk_id
-                            LIMIT 10
-                            """,
-                            item_name=item_name, keyword=keyword,
-                        )
-                        for record in direct_result:
-                            chunk_ids.add(record["chunk_id"])
-                    except Exception as e:
-                        logger.warning(f"Neo4j 实体匹配查询异常 (keyword='{keyword}'): {e}")
+        if entity_item_pairs:
+            # ---- 策略1 + 策略2：基于 (entity_name, item_name) 对的实体匹配 + 1-hop 扩展 ----
+            for entity_name, item_name in entity_item_pairs:
+                # 1a. 直接实体 → 切片
+                try:
+                    direct_result = session.run(
+                        """
+                        MATCH (e:Entity {item_name: $item_name})
+                        WHERE e.name CONTAINS $entity_name
+                        MATCH (e)-[:MENTIONED_IN]->(c:Chunk)
+                        RETURN DISTINCT c.id AS chunk_id
+                        LIMIT 10
+                        """,
+                        item_name=item_name, entity_name=entity_name,
+                    )
+                    for record in direct_result:
+                        chunk_ids.add(record["chunk_id"])
+                except Exception as e:
+                    logger.warning(
+                        f"Neo4j 实体匹配查询异常 "
+                        f"(entity='{entity_name}', item='{item_name}'): {e}"
+                    )
 
-                    # 1b. 1-hop 关联实体 → 切片
-                    try:
-                        related_result = session.run(
-                            """
-                            MATCH (e:Entity {item_name: $item_name})
-                            WHERE e.name CONTAINS $keyword
-                            MATCH (e)-[r]->(related:Entity {item_name: $item_name})
-                            MATCH (related)-[:MENTIONED_IN]->(c:Chunk)
-                            RETURN DISTINCT e.name AS source_entity,
-                                   type(r) AS rel_type,
-                                   related.name AS target_entity,
-                                   c.id AS chunk_id
-                            LIMIT 20
-                            """,
-                            item_name=item_name, keyword=keyword,
-                        )
-                        for record in related_result:
-                            chunk_ids.add(record["chunk_id"])
-                            entity_relations.append({
-                                "source": record["source_entity"],
-                                "relation": record["rel_type"],
-                                "target": record["target_entity"],
-                            })
-                    except Exception as e:
-                        logger.warning(f"Neo4j 关联实体查询异常 (keyword='{keyword}'): {e}")
+                # 1b. 1-hop 关联实体 → 切片
+                try:
+                    related_result = session.run(
+                        """
+                        MATCH (e:Entity {item_name: $item_name})
+                        WHERE e.name CONTAINS $entity_name
+                        MATCH (e)-[r]->(related:Entity {item_name: $item_name})
+                        MATCH (related)-[:MENTIONED_IN]->(c:Chunk)
+                        RETURN DISTINCT e.name AS source_entity,
+                               type(r) AS rel_type,
+                               related.name AS target_entity,
+                               c.id AS chunk_id
+                        LIMIT 20
+                        """,
+                        item_name=item_name, entity_name=entity_name,
+                    )
+                    for record in related_result:
+                        chunk_ids.add(record["chunk_id"])
+                        entity_relations.append({
+                            "source": record["source_entity"],
+                            "relation": record["rel_type"],
+                            "target": record["target_entity"],
+                        })
+                except Exception as e:
+                    logger.warning(
+                        f"Neo4j 关联实体查询异常 "
+                        f"(entity='{entity_name}', item='{item_name}'): {e}"
+                    )
 
-            # ---- 策略3：无关键词时的全量回退 ----
-            if not keywords:
+        else:
+            # ---- 策略3：entity_item_pairs 为空时的全量回退 ----
+            for item_name in item_names:
                 try:
                     fallback_result = session.run(
                         """
@@ -336,7 +382,7 @@ def step_4_neo4j_graph_search(
                     for record in fallback_result:
                         chunk_ids.add(record["chunk_id"])
                 except Exception as e:
-                    logger.warning(f"Neo4j 全量回退查询异常: {e}")
+                    logger.warning(f"Neo4j 全量回退查询异常 (item='{item_name}'): {e}")
 
                 # 回退时也收集实体关系（给 answer_output 用）
                 try:
@@ -355,7 +401,7 @@ def step_4_neo4j_graph_search(
                             "target": record["target"],
                         })
                 except Exception as e:
-                    logger.warning(f"Neo4j 全量关系查询异常: {e}")
+                    logger.warning(f"Neo4j 全量关系查询异常 (item='{item_name}'): {e}")
 
     logger.info(
         f"KG 图搜索完成: 找到 {len(chunk_ids)} 个关联切片, "
@@ -467,8 +513,8 @@ def node_search_kg(state: QueryGraphState) -> dict:
     # Step 3: Milvus 实体名向量对齐 → 映射到图谱中的标准实体名
     aligned_entities = step_3_align_entities_with_milvus(raw_entities, item_names)
 
-    # Step 4: Neo4j 图搜索 → chunk_id 列表 + 实体关系
-    chunk_ids, entity_relations = step_4_neo4j_graph_search(item_names, aligned_entities)
+    # Step 4: Neo4j 图搜索 → (entity_name, item_name) 对直接匹配 CONTAINS + 1-hop
+    chunk_ids, entity_relations = step_4_neo4j_graph_search(aligned_entities, item_names)
 
     # Step 5: Milvus 反查切片内容
     chunks = step_5_query_chunks_from_milvus(chunk_ids)
