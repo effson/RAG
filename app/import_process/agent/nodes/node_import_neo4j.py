@@ -1,10 +1,12 @@
-# 导入基础库：系统、JSON解析、类型注解
+# 导入基础库：系统、JSON解析、类型注解、多线程
 import sys
 import json
 import re
 import os
-from typing import Dict, List, Any, Tuple, Set
+import threading
+from typing import Dict, List, Any, Tuple, Set, Optional
 from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # 导入LangChain消息类（标准化大模型对话消息格式）
 from langchain_core.messages import SystemMessage, HumanMessage
@@ -44,6 +46,10 @@ ALLOWED_REL_TYPES = {
 ALLOWED_ENTITY_LABELS = {
     "DEVICE", "PART", "OPERATION", "STEP", "WARNING", "CONDITION", "TOOL",
 }
+
+# BGE-M3 Embedding 模型互斥锁——本地 PyTorch 模型多线程共享同一份权重，
+# 并发推理会导致内部状态冲突，所有 embedding 调用必须持有此锁
+_embedding_lock = threading.Lock()
 
 
 # ---- 数据结构定义 ----
@@ -207,6 +213,99 @@ def _clean_entities_relations(
     return cleaned_entities, cleaned_relations, stats
 
 
+# ==================== 预阶段：Milvus 集合准备 + 旧数据清理（仅执行一次） ====================
+
+def _prepare_milvus_collection(state: ImportGraphState, global_item_name: str) -> None:
+    """
+    准备 Milvus 实体名称集合（不存在则创建），并按 item_name 清理旧数据。
+    此函数仅在主线程执行一次，后续各子线程直接写入而无需重复准备。
+
+    :param state: 图状态
+    :param global_item_name: 全局产品名称，用于删除旧数据
+    """
+    entity_collection = milvus_config.entity_name_collection
+    if not entity_collection:
+        logger.warning("未配置 ENTITY_NAME_COLLECTION，跳过 Milvus 准备")
+        return
+
+    milvus_client = get_milvus_client()
+    if milvus_client is None:
+        raise RuntimeError("Milvus 客户端不可用，无法写入实体向量。请检查 MILVUS_URL 配置。")
+
+    # 集合不存在则自动创建
+    if not milvus_client.has_collection(entity_collection):
+        logger.info(f"Milvus 实体名称集合 [{entity_collection}] 不存在，自动创建")
+        schema = milvus_client.create_schema(
+            auto_id=True,
+            enable_dynamic_field=True,
+        )
+        schema.add_field(field_name="id", datatype=DataType.INT64, is_primary=True, auto_id=True)
+        schema.add_field(field_name="entity_name", datatype=DataType.VARCHAR, max_length=512)
+        schema.add_field(field_name="chunk_id", datatype=DataType.INT64)
+        schema.add_field(field_name="item_name", datatype=DataType.VARCHAR, max_length=512)
+        schema.add_field(field_name="dense_vector", datatype=DataType.FLOAT_VECTOR, dim=1024)
+        schema.add_field(field_name="sparse_vector", datatype=DataType.SPARSE_FLOAT_VECTOR)
+
+        index_params = milvus_client.prepare_index_params()
+        index_params.add_index(
+            field_name="dense_vector",
+            index_type="AUTOINDEX",
+            index_name="dense_vector_index",
+            metric_type="IP",
+        )
+        index_params.add_index(
+            field_name="sparse_vector",
+            index_type="SPARSE_INVERTED_INDEX",
+            index_name="sparse_vector_index",
+            metric_type="IP",
+            params={"inverted_index_algo": "DAAT_MAXSCORE"},
+        )
+        milvus_client.create_collection(
+            collection_name=entity_collection,
+            schema=schema,
+            index_params=index_params,
+        )
+        logger.info(f"Milvus 实体名称集合 [{entity_collection}] 创建完成")
+
+    # 按 item_name 删除旧数据（幂等）
+    if global_item_name:
+        try:
+            delete_expr = f"item_name=='{global_item_name}'"
+            milvus_client.delete(collection_name=entity_collection, filter=delete_expr)
+            logger.info(f"已清理实体名称集合中 item_name='{global_item_name}' 的旧数据")
+        except Exception as e:
+            logger.warning(f"清理实体名称旧数据异常（可能无旧数据）: {e}")
+
+
+def _cleanup_neo4j_old_data(global_item_name: str) -> None:
+    """
+    按 item_name 清理 Neo4j 中的旧图谱数据（节点 + 关系）。
+    此函数仅在主线程执行一次，后续 Cypher 批处理不再包含清理语句。
+
+    :param global_item_name: 全局产品名称
+    """
+    if not global_item_name:
+        return
+
+    driver = get_neo4j_driver()
+    if driver is None:
+        logger.warning("Neo4j 驱动不可用，跳过旧数据清理")
+        return
+
+    neo4j_config = get_neo4j_config()
+    database = neo4j_config.neo4j_database or "neo4j"
+
+    try:
+        with driver.session(database=database) as session:
+            session.run(
+                "MATCH (n {item_name: $item_name}) DETACH DELETE n",
+                item_name=global_item_name,
+            )
+        logger.info(f"已清理 Neo4j 中 item_name='{global_item_name}' 的旧数据")
+    except Exception as e:
+        logger.warning(f"清理 Neo4j 旧数据异常（可能无旧数据）: {e}")
+
+
 # ==================== Step 函数 ====================
 
 @step_log("step_1_validate_get_inputs")
@@ -267,87 +366,192 @@ def step_1_validate_get_inputs(state: ImportGraphState) -> Tuple[List[Dict[str, 
     return validated_chunks, global_item_name
 
 
-@step_log("step_2_extract_entities_relations")
-def step_2_extract_entities_relations(
-    validated_chunks: List[Dict[str, Any]], global_item_name: str
-) -> Tuple[List[Tuple[str, List[Dict], List[Dict]]], ProcessingStats]:
-    """
-    对每个 chunk 调用 LLM（JSON mode），提取实体和关系。
+# ---- 单 Chunk 的 LLM 实体提取（在子线程中调用） ----
 
-    :param validated_chunks: 校验后的 chunk 列表
-    :param global_item_name: 全局产品名称
-    :return:
+def _extract_single_chunk_llm(
+    chunk_id: str,
+    content: str,
+    chunk_item: str,
+    chunk_index: int = 0,
+    total_chunks: int = 1,
+) -> Tuple[List[Dict], List[Dict]]:
+    """
+    对单个 chunk 调用 LLM（JSON mode）提取实体和关系，含清洗和 3 次重试。
+
+    此函数设计为线程安全——每次调用创建独立的 LLM chain，
+    LLM 客户端本身是 HTTP 调用，无本地共享状态。
+
+    :param chunk_id: 切片 ID
+    :param content: 切片文本内容
+    :param chunk_item: 切片所属产品名称
+    :param chunk_index: 切片序号（仅用于日志）
+    :param total_chunks: 切片总数（仅用于日志）
+    :return: (cleaned_entities, cleaned_relations)
     """
     llm = get_llm_client(json_mode=True)
     parser = JsonOutputParser()
-    extraction_results: List[Tuple[str, List[Dict], List[Dict]]] = []
-    stats = ProcessingStats(total_chunks=len(validated_chunks))
     MAX_RETRIES = 3
 
-    for i, chunk in enumerate(validated_chunks):
-        chunk_id = chunk["chunk_id"]
-        chunk_item = chunk.get("item_name", global_item_name)
-        content = chunk["content"]
+    # 构建提示词（不通过 load_prompt 传参，避免 prompt 中 JSON 示例的 {} 被 str.format() 误解析）
+    prompt_template = load_prompt("entity_extraction")
+    prompt = f"## 输入文本\n{content}\n\n## 所属产品\n{chunk_item}\n\n{prompt_template}"
+    messages = [
+        SystemMessage(content="你是一个专业的知识图谱构建助手，擅长从设备操作手册中提取实体和关系。"),
+        HumanMessage(content=prompt),
+    ]
 
-        # 构建提示词（不通过 load_prompt 传参，避免 prompt 中 JSON 示例的 {} 被 str.format() 误解析）
-        prompt_template = load_prompt("entity_extraction")
-        prompt = f"## 输入文本\n{content}\n\n## 所属产品\n{chunk_item}\n\n{prompt_template}"
-        messages = [
-            SystemMessage(content="你是一个专业的知识图谱构建助手，擅长从设备操作手册中提取实体和关系。"),
-            HumanMessage(content=prompt),
-        ]
+    # 调用 LLM → 提取 content → 清洗 Markdown 包裹 → 解析 JSON
+    chain = llm | RunnableLambda(lambda x: x.content) | RunnableLambda(_strip_markdown_json) | parser
 
-        # 调用 LLM → 提取 content → 清洗 Markdown 包裹 → 解析 JSON
-        chain = llm | RunnableLambda(lambda x: x.content) | RunnableLambda(_strip_markdown_json) | parser
+    entities, relations = [], []
+    last_error = None
 
-        entities, relations = [], []
-        last_error = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            result = chain.invoke(messages)
 
-        for attempt in range(1, MAX_RETRIES + 1):
-            try:
-                result = chain.invoke(messages)
+            # 校验返回结构
+            raw_entities = result.get("entities", []) if isinstance(result, dict) else []
+            raw_relations = result.get("relations", []) if isinstance(result, dict) else []
 
-                # 校验返回结构
-                raw_entities = result.get("entities", []) if isinstance(result, dict) else []
-                raw_relations = result.get("relations", []) if isinstance(result, dict) else []
+            # 清洗：空名过滤、标签白名单、实体去重、孤儿关系过滤
+            entities, relations, clean_stats = _clean_entities_relations(raw_entities, raw_relations)
 
-                # 清洗：空名过滤、标签白名单、实体去重、孤儿关系过滤
-                entities, relations, clean_stats = _clean_entities_relations(raw_entities, raw_relations)
-
-                if entities or relations:
-                    break  # 有有效结果，跳出重试
-                elif attempt < MAX_RETRIES:
-                    logger.info(
-                        f"Chunk {chunk_id} 第 {attempt} 次提取结果为空，准备重试（共 {MAX_RETRIES} 次机会）"
-                    )
-                else:
-                    logger.warning(f"Chunk {chunk_id} 经 {MAX_RETRIES} 次尝试仍无有效实体/关系")
-
-            except Exception as e:
-                last_error = e
-                if attempt < MAX_RETRIES:
-                    logger.warning(
-                        f"Chunk {chunk_id} 第 {attempt} 次提取异常: {e}，准备重试（共 {MAX_RETRIES} 次机会）"
-                    )
-                else:
-                    logger.error(f"Chunk {chunk_id} 经 {MAX_RETRIES} 次尝试均失败: {e}")
-
-        if entities or relations:
-            extraction_results.append((chunk_id, entities, relations))
-            stats.processed_chunks += 1
-            logger.debug(
-                f"Chunk {chunk_id} ({i+1}/{len(validated_chunks)}): "
-                f"提取 {len(entities)} 实体 / {len(relations)} 关系"
-            )
-        else:
-            stats.failed_chunks += 1
-            if last_error:
-                stats.errors.append(f"Chunk {chunk_id} 提取失败: {str(last_error)}")
+            if entities or relations:
+                break  # 有有效结果，跳出重试
+            elif attempt < MAX_RETRIES:
+                logger.info(
+                    f"Chunk {chunk_id} 第 {attempt} 次提取结果为空，准备重试（共 {MAX_RETRIES} 次机会）"
+                )
             else:
-                stats.errors.append(f"Chunk {chunk_id} 提取失败: {MAX_RETRIES} 次尝试后仍无有效实体/关系")
+                logger.warning(f"Chunk {chunk_id} 经 {MAX_RETRIES} 次尝试仍无有效实体/关系")
 
-    logger.info(f"实体提取完成: {stats.processed_chunks} 成功 / {stats.failed_chunks} 失败")
-    return extraction_results, stats
+        except Exception as e:
+            last_error = e
+            if attempt < MAX_RETRIES:
+                logger.warning(
+                    f"Chunk {chunk_id} 第 {attempt} 次提取异常: {e}，准备重试（共 {MAX_RETRIES} 次机会）"
+                )
+            else:
+                logger.error(f"Chunk {chunk_id} 经 {MAX_RETRIES} 次尝试均失败: {e}")
+
+    if entities or relations:
+        logger.debug(
+            f"Chunk {chunk_id} ({chunk_index}/{total_chunks}): "
+            f"提取 {len(entities)} 实体 / {len(relations)} 关系"
+        )
+
+    return entities, relations
+
+
+# ---- 单 Chunk 的 Embedding + Milvus 写入（在子线程中调用，内部持有 _embedding_lock） ----
+
+def _embed_and_insert_chunk_entities(
+    chunk_id: str,
+    entities: List[Dict],
+    chunk_item: str,
+) -> int:
+    """
+    为单个 chunk 的实体名称生成稠密+稀疏向量，并写入 Milvus 实体名称集合。
+
+    内部持有 _embedding_lock 互斥锁，确保 BGE-M3 本地模型不会被并发推理。
+
+    :param chunk_id: 切片 ID
+    :param entities: 清洗后的实体列表（每项含 name 字段）
+    :param chunk_item: 切片所属产品名称
+    :return: 写入的记录数
+    """
+    entity_collection = milvus_config.entity_name_collection
+    if not entity_collection:
+        return 0
+
+    # 收集本 chunk 的实体名称
+    names: List[str] = []
+    for ent in entities:
+        name = str(ent.get("name", "")).strip()
+        if name:
+            names.append(name)
+
+    if not names:
+        return 0
+
+    # BGE-M3 推理——必须持有互斥锁，防止多线程并发调用导致 PyTorch 内部状态冲突
+    with _embedding_lock:
+        embeddings = generate_embeddings(names)
+
+    # 组装待插入数据
+    milvus_client = get_milvus_client()
+    if milvus_client is None:
+        logger.warning("Milvus 客户端不可用，跳过实体向量写入")
+        return 0
+
+    insert_data: List[Dict[str, Any]] = []
+    for i, name in enumerate(names):
+        insert_data.append({
+            "entity_name": name,
+            "chunk_id": int(chunk_id),
+            "item_name": chunk_item,
+            "dense_vector": embeddings["dense"][i],
+            "sparse_vector": embeddings["sparse"][i],
+        })
+
+    result = milvus_client.insert(collection_name=entity_collection, data=insert_data)
+    insert_count = result.get("insert_count", 0)
+    logger.debug(f"Chunk {chunk_id}: {insert_count} 条实体向量已写入 Milvus")
+    return insert_count
+
+
+# ---- 单 Chunk 的完整处理任务（投入线程池的工作单元） ----
+
+def _process_single_chunk(
+    chunk: Dict[str, Any],
+    global_item_name: str,
+    chunk_index: int = 0,
+    total_chunks: int = 1,
+) -> Tuple[str, List[Dict], List[Dict], Optional[str]]:
+    """
+    单个 chunk 的完整处理管线（在子线程中执行）：
+    1. LLM 实体关系提取 + 数据清洗
+    2. BGE-M3 Embedding + Milvus 写入
+
+    此函数捕获所有异常，不会让线程崩溃。
+
+    :param chunk: 切片字典，需包含 chunk_id / content / item_name
+    :param global_item_name: 全局产品名称（兜底）
+    :param chunk_index: 切片序号（日志用）
+    :param total_chunks: 切片总数（日志用）
+    :return: (chunk_id, entities, relations, error_msg)
+             error_msg 为 None 表示成功（即使实体/关系为空）
+    """
+    chunk_id = str(chunk.get("chunk_id", ""))
+    chunk_item = str(chunk.get("item_name", global_item_name))
+    content = str(chunk.get("content", ""))
+    error_msg: Optional[str] = None
+
+    try:
+        # Step A: LLM 提取 + 清洗
+        entities, relations = _extract_single_chunk_llm(
+            chunk_id=chunk_id,
+            content=content,
+            chunk_item=chunk_item,
+            chunk_index=chunk_index,
+            total_chunks=total_chunks,
+        )
+
+        # Step B: BGE-M3 Embedding + Milvus 写入
+        if entities:
+            _embed_and_insert_chunk_entities(
+                chunk_id=chunk_id,
+                entities=entities,
+                chunk_item=chunk_item,
+            )
+
+        return (chunk_id, entities, relations, error_msg)
+
+    except Exception as e:
+        error_msg = f"Chunk {chunk_id} 处理异常: {e}"
+        logger.error(error_msg)
+        return (chunk_id, [], [], error_msg)
 
 
 @step_log("step_4_build_cypher")
@@ -362,8 +566,11 @@ def step_4_build_cypher(
     实体以 name + item_name 为标识，同名实体合并标签（Neo4j 多标签）
     和 description（拼接），实现查询收敛。
 
+    注意：Neo4j 旧数据清理已在预阶段由 _cleanup_neo4j_old_data 完成，
+    此处不再包含 DETACH DELETE 语句。
+
     :param state: 图状态
-    :param extraction_results: step_2 的提取结果
+    :param extraction_results: 各 chunk 的提取结果
     :param stats: 处理统计
     :return: cypher_batch: [(cypher_statement, params_dict), ...]
     """
@@ -431,18 +638,9 @@ def step_4_build_cypher(
     )
 
     # ---- 构建 Cypher 语句 ----
+    # 注：Neo4j 旧数据清理已由 _cleanup_neo4j_old_data 在预阶段完成
 
     cypher_batch: List[Tuple[str, Dict[str, Any]]] = []
-
-    # 0. 清理旧数据
-    if global_item_name:
-        cypher_batch.append((
-            """
-            MATCH (n {item_name: $item_name})
-            DETACH DELETE n
-            """,
-            {"item_name": global_item_name},
-        ))
 
     # 1. 实体节点
     # label → Neo4j 节点标签（:Entity:DEVICE:PART ...），同名实体合并标签和 description
@@ -520,134 +718,6 @@ def step_4_build_cypher(
     return cypher_batch
 
 
-@step_log("step_3_import_entity_vectors")
-def step_3_import_entity_vectors(
-    state: ImportGraphState,
-    extraction_results: List[Tuple[str, List[Dict], List[Dict]]],
-) -> None:
-    """
-    将提取的实体名称通过 BGE-M3 生成稠密+稀疏向量，存入 Milvus 实体名称集合。
-
-    每个 (实体名, chunk_id) 对存储一条记录，支持按 chunk_id 追溯实体来源，
-    后续查询时可按实体名做稠密+稀疏混合检索，定位相关实体所在的文档切片。
-
-    :param state: 图状态（获取 item_name 等全局字段）
-    :param extraction_results: step_2 的提取结果 [(chunk_id, entities, relations), ...]
-    """
-    entity_collection = milvus_config.entity_name_collection
-    if not entity_collection:
-        logger.warning("未配置 ENTITY_NAME_COLLECTION，跳过实体向量入库")
-        return
-
-    # ---- 第一步：收集所有 (实体名, chunk_id, item_name) 三元组 ----
-    entity_rows: List[Dict[str, Any]] = []  # {entity_name, chunk_id, item_name}
-    seen_pairs: Set[Tuple[str, str]] = set()  # (entity_name, chunk_id) 去重
-
-    # 构建 chunk_id → item_name 快速查找表
-    chunk_item_map: Dict[str, str] = {}
-    for ch in state.get("chunks", []):
-        cid = str(ch.get("chunk_id", ""))
-        if cid:
-            chunk_item_map[cid] = str(ch.get("item_name", ""))
-
-    global_item_name = str(state.get("item_name", "")).strip()
-
-    for chunk_id, entities, _ in extraction_results:
-        chunk_id_str = str(chunk_id)
-        chunk_item = chunk_item_map.get(chunk_id_str, global_item_name)
-        if not chunk_item:
-            chunk_item = global_item_name
-
-        for ent in entities:
-            name = str(ent.get("name", "")).strip()
-            if not name:
-                continue
-            key = (name, chunk_id_str)
-            if key in seen_pairs:
-                continue
-            seen_pairs.add(key)
-            entity_rows.append({
-                "entity_name": name,
-                "chunk_id": int(chunk_id),
-                "item_name": chunk_item,
-            })
-
-    if not entity_rows:
-        logger.info("没有实体需要存入 Milvus 实体名称集合")
-        return
-
-    logger.info(f"准备为 {len(entity_rows)} 条 (实体, chunk) 对生成向量并入库")
-
-    # ---- 第二步：准备 Milvus 集合（获取客户端 + 不存在则创建） ----
-    milvus_client = get_milvus_client()
-    if milvus_client is None:
-        raise RuntimeError("Milvus 客户端不可用，无法写入实体向量。请检查 MILVUS_URL 配置。")
-
-    if not milvus_client.has_collection(entity_collection):
-        logger.info(f"Milvus 实体名称集合 [{entity_collection}] 不存在，自动创建")
-        schema = milvus_client.create_schema(
-            auto_id=True,
-            enable_dynamic_field=True,
-        )
-        schema.add_field(field_name="id", datatype=DataType.INT64, is_primary=True, auto_id=True)
-        schema.add_field(field_name="entity_name", datatype=DataType.VARCHAR, max_length=512)
-        schema.add_field(field_name="chunk_id", datatype=DataType.INT64)
-        schema.add_field(field_name="item_name", datatype=DataType.VARCHAR, max_length=512)
-        schema.add_field(field_name="dense_vector", datatype=DataType.FLOAT_VECTOR, dim=1024)
-        schema.add_field(field_name="sparse_vector", datatype=DataType.SPARSE_FLOAT_VECTOR)
-
-        index_params = milvus_client.prepare_index_params()
-        index_params.add_index(
-            field_name="dense_vector",
-            index_type="AUTOINDEX",
-            index_name="dense_vector_index",
-            metric_type="IP",
-        )
-        index_params.add_index(
-            field_name="sparse_vector",
-            index_type="SPARSE_INVERTED_INDEX",
-            index_name="sparse_vector_index",
-            metric_type="IP",
-            params={"inverted_index_algo": "DAAT_MAXSCORE"},
-        )
-        milvus_client.create_collection(
-            collection_name=entity_collection,
-            schema=schema,
-            index_params=index_params,
-        )
-        logger.info(f"Milvus 实体名称集合 [{entity_collection}] 创建完成")
-
-    # ---- 第三步：按 item_name 删除旧数据（幂等，在生成向量前清理） ----
-    if global_item_name:
-        try:
-            delete_expr = f"item_name=='{global_item_name}'"
-            milvus_client.delete(collection_name=entity_collection, filter=delete_expr)
-            logger.info(f"已清理实体名称集合中 item_name='{global_item_name}' 的旧数据")
-        except Exception as e:
-            logger.warning(f"清理实体名称旧数据异常（可能无旧数据）: {e}")
-
-    # ---- 第四步：调用 BGE-M3 生成稠密+稀疏向量 ----
-    entity_names = [row["entity_name"] for row in entity_rows]
-    embeddings = generate_embeddings(entity_names)
-
-    # ---- 第五步：组装待插入数据（向量附加到每一行） ----
-    insert_data: List[Dict[str, Any]] = []
-    for i, row in enumerate(entity_rows):
-        insert_data.append({
-            "entity_name": row["entity_name"],
-            "chunk_id": row["chunk_id"],
-            "item_name": row["item_name"],
-            "dense_vector": embeddings["dense"][i],
-            "sparse_vector": embeddings["sparse"][i],
-        })
-
-    # ---- 第六步：批量插入 ----
-    result = milvus_client.insert(collection_name=entity_collection, data=insert_data)
-    insert_count = result.get("insert_count", 0)
-    milvus_client.flush(collection_name=entity_collection)
-    logger.info(f"实体向量入库完成: {insert_count} 条记录 → Milvus集合[{entity_collection}]")
-
-
 @step_log("step_5_execute_neo4j")
 def step_5_execute_neo4j(
     cypher_batch: List[Tuple[str, Dict[str, Any]]], stats: ProcessingStats
@@ -704,11 +774,30 @@ def step_6_update_state(state: ImportGraphState, stats: ProcessingStats):
 
 # ==================== LangGraph 入口节点 ====================
 
+# 线程池最大并发数——LLM 提取以 API 调用为主（IO 密集型），并发数可适当调高；
+# 但 BGE-M3 Embedding 受互斥锁序列化，实际并发收益主要来自 LLM 阶段的重叠调用
+_MAX_WORKERS = 4
+
+
 @node_log("node_import_neo4j")
 def node_import_neo4j(state: ImportGraphState) -> ImportGraphState:
     """
     节点功能：从文档切块中提取实体和关系，构建知识图谱并写入 Neo4j，
     同时将实体名称向量化存入 Milvus 实体名称集合，支持后续实体级混合检索。
+
+    多线程执行流程：
+      ┌─ 预阶段（主线程，仅一次）────────────────────────────┐
+      │  · 校验 chunks · 准备 Milvus 集合 · 清理 Milvus/Neo4j 旧数据 │
+      └──────────────────────────────────────────────────────┘
+                              ↓
+      ┌─ 并发阶段（线程池，每个 chunk 一个任务）──────────────┐
+      │  每个子线程: LLM 提取+清洗 → BGE-M3 Embedding(互斥锁) │
+      │              → Milvus 写入 → 返回 (实体, 关系)        │
+      └──────────────────────────────────────────────────────┘
+                              ↓
+      ┌─ 收尾阶段（主线程，等待所有线程完成）─────────────────┐
+      │  跨 chunk 聚合去重 → 构建 Cypher → Neo4j 写入 → 更新 state │
+      └──────────────────────────────────────────────────────┘
 
     前置依赖：
       - state["chunks"] 中每个 chunk 须包含 chunk_id（由 node_import_milvus 回写）
@@ -720,30 +809,87 @@ def node_import_neo4j(state: ImportGraphState) -> ImportGraphState:
       - Milvus 实体名称集合中的实体稠密+稀疏向量（可按实体名做混合检索）
       - state["kg_id"] / state["kg_stats"]
     """
-    # 日志+任务处理
+    # 任务开始
     add_running_task(state["task_id"], "node_import_neo4j")
 
-    # 1. 参数校验与清洗
+    # ---- 第一阶段：参数校验 ----
     validated_chunks, global_item_name = step_1_validate_get_inputs(state)
+    total = len(validated_chunks)
 
-    # 2. LLM 实体关系提取
-    extraction_results, stats = step_2_extract_entities_relations(
-        validated_chunks, global_item_name
-    )
+    # ---- 第二阶段：预准备（主线程，仅一次） ----
+    # 准备 Milvus 集合 + 清理 Milvus 旧数据
+    _prepare_milvus_collection(state, global_item_name)
 
-    # 3. 实体名称向量化并存入 Milvus
-    step_3_import_entity_vectors(state, extraction_results)
+    # 清理 Neo4j 旧数据
+    _cleanup_neo4j_old_data(global_item_name)
 
-    # 4. 去重 + 构建 Cypher 语句
-    cypher_batch = step_4_build_cypher(state, extraction_results, stats)
+    # ---- 第三阶段：多线程并发处理每个 chunk ----
+    stats = ProcessingStats(total_chunks=total)
+    extraction_results: List[Tuple[str, List[Dict], List[Dict]]] = []
 
-    # 5. 执行 Cypher 写入 Neo4j
-    step_5_execute_neo4j(cypher_batch, stats)
+    # 根据 chunk 数量动态调整线程池大小
+    max_workers = min(_MAX_WORKERS, total) if total > 0 else 1
+    logger.info(f"启动线程池（max_workers={max_workers}），开始并发处理 {total} 个切片")
 
-    # 6. 更新 state
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # 提交所有任务
+        future_to_chunk = {
+            executor.submit(
+                _process_single_chunk,
+                chunk=chunk,
+                global_item_name=global_item_name,
+                chunk_index=i + 1,
+                total_chunks=total,
+            ): chunk
+            for i, chunk in enumerate(validated_chunks)
+        }
+
+        # 按完成顺序收集结果
+        for future in as_completed(future_to_chunk):
+            chunk = future_to_chunk[future]
+            chunk_id = str(chunk.get("chunk_id", "unknown"))
+            try:
+                cid, entities, relations, error_msg = future.result()
+                if error_msg:
+                    stats.failed_chunks += 1
+                    stats.errors.append(error_msg)
+                elif entities or relations:
+                    extraction_results.append((cid, entities, relations))
+                    stats.processed_chunks += 1
+                else:
+                    stats.failed_chunks += 1
+                    stats.errors.append(f"Chunk {cid} 提取结果为空")
+                    logger.warning(f"Chunk {cid} 未提取到任何实体/关系")
+            except Exception as e:
+                stats.failed_chunks += 1
+                stats.errors.append(f"Chunk {chunk_id} 线程异常: {e}")
+                logger.error(f"Chunk {chunk_id} 线程异常: {e}")
+
+    # Milvus 批量 flush，确保所有子线程写入的数据持久化
+    entity_collection = milvus_config.entity_name_collection
+    if entity_collection:
+        try:
+            milvus_client = get_milvus_client()
+            if milvus_client:
+                milvus_client.flush(collection_name=entity_collection)
+                logger.debug(f"Milvus 集合 [{entity_collection}] flush 完成")
+        except Exception as e:
+            logger.warning(f"Milvus flush 异常: {e}")
+
+    logger.info(f"多线程处理完成: {stats.processed_chunks} 成功 / {stats.failed_chunks} 失败")
+
+    # ---- 第四阶段：构建 Cypher 并写入 Neo4j ----
+    if not extraction_results:
+        logger.warning("所有 chunk 均未提取到实体/关系，跳过 Neo4j 写入")
+        stats.errors.append("所有 chunk 均未提取到有效实体/关系")
+    else:
+        cypher_batch = step_4_build_cypher(state, extraction_results, stats)
+        step_5_execute_neo4j(cypher_batch, stats)
+
+    # ---- 第五阶段：更新 state ----
     step_6_update_state(state, stats)
 
-    # 日志+任务处理
+    # 任务结束
     add_done_task(state["task_id"], "node_import_neo4j")
     return state
 
