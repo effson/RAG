@@ -186,7 +186,7 @@ def step_3_align_entities_with_milvus(
         logger.warning(f"实体名向量化失败: {e}，使用 LLM 原始实体名")
         return llm_entities
 
-    # 3b. 逐实体混合检索：dense(0.9) + sparse(0.1)，top1 + 阈值过滤
+    # 3b. 逐实体混合检索：dense(0.4) + sparse(0.6)，top1 + 阈值过滤
     expr_str = f"item_name in {item_names}"
     aligned: List[str] = []
     skipped = 0
@@ -203,7 +203,7 @@ def step_3_align_entities_with_milvus(
                 client=milvus_client,
                 collection_name=entity_collection,
                 reqs=reqs,
-                ranker_weights=(0.8, 0.2),
+                ranker_weights=(0.4, 0.6),
                 norm_score=True,
                 limit=1,
                 output_fields=["entity_name"],
