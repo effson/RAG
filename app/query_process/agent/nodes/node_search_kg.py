@@ -1,7 +1,8 @@
 # KG（知识图谱）检索节点：利用 Neo4j 中的实体关系图，通过实体名匹配和图遍历定位相关切片
+import collections
 import re
 import sys
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Set
 
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_core.output_parsers import JsonOutputParser
@@ -38,6 +39,17 @@ ENTITY_ALIGN_SCORE_THRESHOLD = 0.50
 
 # 图谱实体类型中文描述（与 entity_recognition.prompt 中的 {allow_entity_labels_cn} 对应）
 ALLOW_ENTITY_LABELS_CN = "Device(设备), Part(部件), Operation(操作), Step(步骤), Warning(警告), Condition(条件), Tool(工具)"
+
+# ---- Neo4j 图搜索配置 ----
+# 种子节点数量上限（防止后续一跳查询笛卡尔积爆炸）
+SEED_NODE_MAX = 20
+
+# CONTAINS 模糊匹配每实体最多取几条
+CONTAINS_MATCH_LIMIT = 3
+
+# MENTIONED_IN Chunk 打分权重
+SEED_CHUNK_WEIGHT = 2
+NEIGHBOR_CHUNK_WEIGHT = 1
 
 
 @step_log("step_1_data_validates")
@@ -289,189 +301,329 @@ def step_4_neo4j_graph_search(
     item_names: List[str],
 ) -> tuple:
     """
-    在 Neo4j 中执行图搜索，通过实体名匹配和图关系遍历定位相关切片。
+    在 Neo4j 中执行图搜索，五个子步骤：
 
-    查询策略（按优先级）：
-    1. (entity_name, item_name) 对精确匹配 → 沿 MENTIONED_IN 边获取直接提及的切片
-    2. 1-hop 关系扩展 → 获取关联实体的切片（如问"漏电保护"也能找到"电源规格"切片）
-    3. 无实体对回退 → 获取该产品下所有实体的切片（保证 KG 路始终有输出）
+    4a. 种子节点定位：对每个 (entity_name, item_name) 对，先精确匹配 Entity 节点，
+        找不到时 CONTAINS 模糊降级；种子总数有 SEED_NODE_MAX 上限。
+    4b. 一跳关系扩展：从种子节点双向查询邻居（过滤 MENTIONED_IN），
+        保留真实方向（head→tail 与图谱一致），跨种子边去重。
+    4c. MENTIONED_IN 反查 Chunk 加权打分：种子提及的 Chunk 得 2 分，
+        一跳邻居提及的 Chunk 得 1 分；按 (得分, 提及次数) 降序排列。
+    4d. Milvus 批量回填：按排序后的 chunk_id 列表从 Milvus 批量获取切片文本，
+        结果按加权得分降序重排。
+    4e. 三元组转文本：将一跳实体关系转为 LLM 易理解的文本描述。
+
+    回退策略：entity_item_pairs 为空时，以 item_name 下全部 Entity 为种子。
 
     :param entity_item_pairs: (实体名, 商品名) 对列表，来自 step_3 对齐结果
-    :param item_names: 确认的产品名称列表（entity_item_pairs 为空时的回退用）
-    :return: (chunk_ids: List[str], entity_relations: List[Dict])
-             chunk_ids 为 Neo4j 中 Chunk 节点的 id（字符串），
-             entity_relations 为实体间关系列表 [{source, relation, target}]
+    :param item_names: 商品名列表（entity_item_pairs 为空时的回退用）
+    :return: (kg_chunks: List[Dict], entity_relations: List[Dict], kg_triple_text: str)
+             kg_chunks 为 RRF 兼容格式 [{"id": ..., "entity": {...}}, ...]，已按得分降序
+             entity_relations 为实体关系 [{source, relation, target}]
+             kg_triple_text 为三元组文本描述（供 answer_output prompt 拼装）
     """
     driver = get_neo4j_driver()
     if driver is None:
         logger.warning("Neo4j 驱动不可用，跳过 KG 图搜索")
-        return [], []
+        return [], [], ""
 
     neo4j_config = get_neo4j_config()
     database = neo4j_config.neo4j_database or "neo4j"
 
-    chunk_ids: set = set()
-    entity_relations: List[Dict] = []
+    # ---- 4a. 种子节点定位 ----
+    seed_entities: Set[Tuple[str, str]] = set()  # (name, item_name)
 
     with driver.session(database=database) as session:
         if entity_item_pairs:
-            # ---- 策略1 + 策略2：基于 (entity_name, item_name) 对的实体匹配 + 1-hop 扩展 ----
             for entity_name, item_name in entity_item_pairs:
-                # 1a. 直接实体 → 切片
-                try:
-                    direct_result = session.run(
-                        """
-                        MATCH (e:Entity {item_name: $item_name})
-                        WHERE e.name CONTAINS $entity_name
-                        MATCH (e)-[:MENTIONED_IN]->(c:Chunk)
-                        RETURN DISTINCT c.id AS chunk_id
-                        LIMIT 10
-                        """,
-                        item_name=item_name, entity_name=entity_name,
-                    )
-                    for record in direct_result:
-                        chunk_ids.add(record["chunk_id"])
-                except Exception as e:
-                    logger.warning(
-                        f"Neo4j 实体匹配查询异常 "
-                        f"(entity='{entity_name}', item='{item_name}'): {e}"
-                    )
+                if len(seed_entities) >= SEED_NODE_MAX:
+                    break
 
-                # 1b. 1-hop 关联实体 → 切片
+                # 4a-i. 精确匹配：(name, item_name) 组合在导入侧 MERGE 写入，事实上唯一
                 try:
-                    related_result = session.run(
+                    exact_result = session.run(
+                        """
+                        MATCH (e:Entity {name: $name, item_name: $item_name})
+                        RETURN e.name AS name, e.item_name AS item_name
+                        LIMIT 1
+                        """,
+                        name=entity_name, item_name=item_name,
+                    )
+                    exact_records = list(exact_result)
+                    if exact_records:
+                        for rec in exact_records:
+                            seed_entities.add((rec["name"], rec["item_name"]))
+                        logger.debug(f"种子节点(精确): '{entity_name}' @ {item_name}")
+                        continue
+                except Exception as e:
+                    logger.warning(f"种子精确匹配异常 ('{entity_name}' @ {item_name}): {e}")
+
+                # 4a-ii. CONTAINS 模糊降级
+                try:
+                    fuzzy_result = session.run(
                         """
                         MATCH (e:Entity {item_name: $item_name})
-                        WHERE e.name CONTAINS $entity_name
-                        MATCH (e)-[r]->(related:Entity {item_name: $item_name})
-                        MATCH (related)-[:MENTIONED_IN]->(c:Chunk)
-                        RETURN DISTINCT e.name AS source_entity,
-                               type(r) AS rel_type,
-                               related.name AS target_entity,
-                               c.id AS chunk_id
-                        LIMIT 20
+                        WHERE e.name CONTAINS $name
+                        RETURN e.name AS name, e.item_name AS item_name
+                        LIMIT $limit
                         """,
-                        item_name=item_name, entity_name=entity_name,
+                        name=entity_name, item_name=item_name,
+                        limit=CONTAINS_MATCH_LIMIT,
                     )
-                    for record in related_result:
-                        chunk_ids.add(record["chunk_id"])
-                        entity_relations.append({
-                            "source": record["source_entity"],
-                            "relation": record["rel_type"],
-                            "target": record["target_entity"],
-                        })
+                    fuzzy_count = 0
+                    for rec in fuzzy_result:
+                        if len(seed_entities) >= SEED_NODE_MAX:
+                            break
+                        seed_entities.add((rec["name"], rec["item_name"]))
+                        fuzzy_count += 1
+                    if fuzzy_count > 0:
+                        logger.debug(
+                            f"种子节点(模糊): '{entity_name}' → {fuzzy_count} 个 @ {item_name}"
+                        )
+                    else:
+                        logger.debug(f"种子节点 ✗: '{entity_name}' @ {item_name} 无匹配")
                 except Exception as e:
-                    logger.warning(
-                        f"Neo4j 关联实体查询异常 "
-                        f"(entity='{entity_name}', item='{item_name}'): {e}"
-                    )
+                    logger.warning(f"种子模糊匹配异常 ('{entity_name}' @ {item_name}): {e}")
 
         else:
-            # ---- 策略3：entity_item_pairs 为空时的全量回退 ----
-            for item_name in item_names:
-                try:
-                    fallback_result = session.run(
-                        """
-                        MATCH (e:Entity {item_name: $item_name})
-                        MATCH (e)-[:MENTIONED_IN]->(c:Chunk)
-                        RETURN DISTINCT c.id AS chunk_id
-                        LIMIT 30
-                        """,
-                        item_name=item_name,
-                    )
-                    for record in fallback_result:
-                        chunk_ids.add(record["chunk_id"])
-                except Exception as e:
-                    logger.warning(f"Neo4j 全量回退查询异常 (item='{item_name}'): {e}")
+            # entity_item_pairs 为空表示 LLM 未提取到任何实体，无需继续
+            logger.info("KG 图搜索: entity_item_pairs 为空，跳过")
+            return [], [], ""
 
-                # 回退时也收集实体关系（给 answer_output 用）
-                try:
-                    rel_result = session.run(
-                        """
-                        MATCH (e1:Entity {item_name: $item_name})-[r]->(e2:Entity {item_name: $item_name})
-                        RETURN DISTINCT e1.name AS source, type(r) AS rel_type, e2.name AS target
-                        LIMIT 50
-                        """,
-                        item_name=item_name,
-                    )
-                    for record in rel_result:
+    if not seed_entities:
+        logger.info("KG 图搜索: 未找到任何种子节点")
+        return [], [], ""
+
+    logger.info(f"KG 图搜索 - 4a 种子节点: {len(seed_entities)} 个")
+
+    # ---- 4b. 一跳关系扩展 ----
+    entity_relations: List[Dict] = []
+    neighbor_entities: Set[Tuple[str, str]] = set()  # (name, item_name)
+    seen_edges: Set[Tuple[str, str, str, str, str]] = set()
+    # edge key: (head_name, head_item, rel_type, tail_name, tail_item)
+
+    with driver.session(database=database) as session:
+        for seed_name, seed_item in seed_entities:
+            # 4b-i. 出边：seed → neighbor
+            try:
+                out_result = session.run(
+                    """
+                    MATCH (e:Entity {name: $name, item_name: $item_name})
+                          -[r]->(neighbor:Entity {item_name: $item_name})
+                    WHERE type(r) <> 'MENTIONED_IN'
+                    RETURN e.name AS head, type(r) AS rel_type, neighbor.name AS tail
+                    """,
+                    name=seed_name, item_name=seed_item,
+                )
+                for rec in out_result:
+                    head, rel, tail = rec["head"], rec["rel_type"], rec["tail"]
+                    edge_key = (head, seed_item, rel, tail, seed_item)
+                    if edge_key not in seen_edges:
+                        seen_edges.add(edge_key)
                         entity_relations.append({
-                            "source": record["source"],
-                            "relation": record["rel_type"],
-                            "target": record["target"],
+                            "source": head,
+                            "source_item": seed_item,
+                            "relation": rel,
+                            "target": tail,
+                            "target_item": seed_item,
                         })
-                except Exception as e:
-                    logger.warning(f"Neo4j 全量关系查询异常 (item='{item_name}'): {e}")
+                        neighbor_entities.add((tail, seed_item))
+            except Exception as e:
+                logger.warning(f"一跳出边查询异常 (seed='{seed_name}' @ {seed_item}): {e}")
+
+            # 4b-ii. 入边：neighbor → seed
+            try:
+                in_result = session.run(
+                    """
+                    MATCH (neighbor:Entity {item_name: $item_name})
+                          -[r]->(e:Entity {name: $name, item_name: $item_name})
+                    WHERE type(r) <> 'MENTIONED_IN'
+                    RETURN neighbor.name AS head, type(r) AS rel_type, e.name AS tail
+                    """,
+                    name=seed_name, item_name=seed_item,
+                )
+                for rec in in_result:
+                    head, rel, tail = rec["head"], rec["rel_type"], rec["tail"]
+                    edge_key = (head, seed_item, rel, tail, seed_item)
+                    if edge_key not in seen_edges:
+                        seen_edges.add(edge_key)
+                        entity_relations.append({
+                            "source": head,
+                            "source_item": seed_item,
+                            "relation": rel,
+                            "target": tail,
+                            "target_item": seed_item,
+                        })
+                        neighbor_entities.add((head, seed_item))
+            except Exception as e:
+                logger.warning(f"一跳入边查询异常 (seed='{seed_name}' @ {seed_item}): {e}")
+
+    # 邻居节点排除种子节点自身（种子→种子 的边只计一次关系，不计为邻居）
+    neighbor_entities -= seed_entities
 
     logger.info(
-        f"KG 图搜索完成: 找到 {len(chunk_ids)} 个关联切片, "
-        f"{len(entity_relations)} 条实体关系"
-    )
-    return list(chunk_ids), entity_relations
-
-
-@step_log("step_5_query_chunks_from_milvus")
-def step_5_query_chunks_from_milvus(chunk_ids: List[str]) -> List[Dict]:
-    """
-    通过 chunk_id 列表从 Milvus 反查切片完整内容（文本、标题等）。
-    使用 milvus_utils 中已有的 fetch_chunks_by_chunk_ids 工具函数。
-
-    Neo4j 的 Chunk 节点只存 id，不含 content，所以必须回查 Milvus 补全。
-
-    :param chunk_ids: Neo4j 返回的 chunk_id 字符串列表
-    :return: Milvus 实体列表 [{chunk_id, content, title, ...}]
-    """
-    if not chunk_ids:
-        return []
-
-    milvus_client = get_milvus_client()
-    if milvus_client is None:
-        logger.warning("Milvus 客户端不可用，无法反查切片内容")
-        return []
-
-    output_fields = ["chunk_id", "item_name", "content", "title", "parent_title", "part", "file_title"]
-    chunks = fetch_chunks_by_chunk_ids(
-        client=milvus_client,
-        collection_name=milvus_config.chunks_collection,
-        chunk_ids=chunk_ids,
-        output_fields=output_fields,
-        batch_size=100,
+        f"KG 图搜索 - 4b 一跳扩展: {len(entity_relations)} 条边, "
+        f"{len(neighbor_entities)} 个邻居节点"
     )
 
-    logger.info(f"KG检索 - Milvus 反查: {len(chunk_ids)} 个 ID → 命中 {len(chunks)} 个切片")
-    return chunks
+    # ---- 4c. MENTIONED_IN 反查 Chunk 加权打分 ----
+    chunk_scores: Dict[str, int] = collections.defaultdict(int)
+    chunk_mentions: Dict[str, int] = collections.defaultdict(int)
+
+    with driver.session(database=database) as session:
+        # 按 item_name 分组批量查询，减少 Cypher 调用次数
+        for item_name in item_names:
+            # 4c-i. 种子节点 MENTIONED_IN → Chunk（权重 2）
+            seed_names_for_item = [
+                n for n, i in seed_entities if i == item_name
+            ]
+            if seed_names_for_item:
+                try:
+                    seed_chunk_result = session.run(
+                        """
+                        MATCH (e:Entity {item_name: $item_name})
+                              -[:MENTIONED_IN]->(c:Chunk)
+                        WHERE e.name IN $names
+                        RETURN c.id AS chunk_id
+                        """,
+                        item_name=item_name, names=seed_names_for_item,
+                    )
+                    for rec in seed_chunk_result:
+                        cid = rec["chunk_id"]
+                        chunk_scores[cid] += SEED_CHUNK_WEIGHT
+                        chunk_mentions[cid] += 1
+                except Exception as e:
+                    logger.warning(f"种子 Chunk 反查异常 (item='{item_name}'): {e}")
+
+            # 4c-ii. 邻居节点 MENTIONED_IN → Chunk（权重 1）
+            neighbor_names_for_item = [
+                n for n, i in neighbor_entities if i == item_name
+            ]
+            if neighbor_names_for_item:
+                try:
+                    neighbor_chunk_result = session.run(
+                        """
+                        MATCH (e:Entity {item_name: $item_name})
+                              -[:MENTIONED_IN]->(c:Chunk)
+                        WHERE e.name IN $names
+                        RETURN c.id AS chunk_id
+                        """,
+                        item_name=item_name, names=neighbor_names_for_item,
+                    )
+                    for rec in neighbor_chunk_result:
+                        cid = rec["chunk_id"]
+                        chunk_scores[cid] += NEIGHBOR_CHUNK_WEIGHT
+                        chunk_mentions[cid] += 1
+                except Exception as e:
+                    logger.warning(f"邻居 Chunk 反查异常 (item='{item_name}'): {e}")
+
+    # 排序：得分降序 → 提及次数降序
+    sorted_chunk_ids = sorted(
+        chunk_scores.keys(),
+        key=lambda cid: (chunk_scores[cid], chunk_mentions[cid]),
+        reverse=True,
+    )
+
+    logger.info(
+        f"KG 图搜索 - 4c Chunk 打分: {len(sorted_chunk_ids)} 个 Chunk "
+        f"(top5 得分: {[chunk_scores[c] for c in sorted_chunk_ids[:5]]})"
+    )
+
+    # ---- 4d. Milvus 批量回填切片内容 + 按得分重排 ----
+    kg_chunks: List[Dict] = []
+    if sorted_chunk_ids:
+        milvus_client = get_milvus_client()
+        if milvus_client is not None:
+            output_fields = [
+                "chunk_id", "item_name", "content", "title",
+                "parent_title", "part", "file_title",
+            ]
+            raw_chunks = fetch_chunks_by_chunk_ids(
+                client=milvus_client,
+                collection_name=milvus_config.chunks_collection,
+                chunk_ids=sorted_chunk_ids,
+                output_fields=output_fields,
+                batch_size=100,
+            )
+            # 建立 chunk_id → 实体 的索引（key 统一为 int，Milvus INT64 主键）
+            chunk_map: Dict[int, Dict] = {}
+            for ch in raw_chunks:
+                cid = ch.get("chunk_id")
+                if cid is not None:
+                    chunk_map[int(cid)] = ch
+
+            # 按加权得分降序重排，构建 RRF 兼容格式
+            # sorted_chunk_ids 来自 Neo4j 的 c.id 属性（导入侧以 str 存储），
+            # 需转为 int 才能与 chunk_map 的 int key 匹配
+            for cid_str in sorted_chunk_ids:
+                try:
+                    cid = int(cid_str)
+                except (ValueError, TypeError):
+                    logger.warning(f"KG 图搜索 - 4d: chunk_id '{cid_str}' 无法转为 int，跳过")
+                    continue
+                ch = chunk_map.get(cid)
+                if ch is None:
+                    logger.debug(
+                        f"KG 图搜索 - 4d: chunk_id {cid}（Neo4j）在 Milvus 中未找到对应切片，可能数据已过期"
+                    )
+                    continue
+                kg_chunks.append({
+                    "id": cid,
+                    "entity": {
+                        "chunk_id": cid,
+                        "item_name": ch.get("item_name", ""),
+                        "content": ch.get("content", ""),
+                        "title": ch.get("title", ""),
+                        "parent_title": ch.get("parent_title", ""),
+                        "part": ch.get("part", ""),
+                        "file_title": ch.get("file_title", ""),
+                    },
+                    # 附加 KG 特有字段，供下游 answer_output 使用
+                    "_kg_score": chunk_scores.get(cid_str, 0),
+                    "_kg_mentions": chunk_mentions.get(cid_str, 0),
+                })
+
+            logger.info(
+                f"KG 图搜索 - 4d Milvus 回填: {len(sorted_chunk_ids)} 个 ID "
+                f"→ 命中 {len(kg_chunks)} 个切片"
+            )
+        else:
+            logger.warning("Milvus 客户端不可用，跳过切片内容回填")
+
+    # ---- 4e. 三元组转文本描述 ----
+    kg_triple_text = _format_triple_text(entity_relations)
+
+    logger.info(
+        f"KG 图搜索完成: {len(kg_chunks)} 个切片（已排序）, "
+        f"{len(entity_relations)} 条实体关系, "
+        f"三元组文本 {len(kg_triple_text)} 字符"
+    )
+    return kg_chunks, entity_relations, kg_triple_text
 
 
-@step_log("step_6_format_for_rrf")
-def step_6_format_for_rrf(
-    chunks: List[Dict], entity_relations: List[Dict]
-) -> List[Dict]:
-    """
-    将 KG 检索结果格式化为 RRF 节点兼容的格式。
+def _format_triple_text(triples: List[Dict]) -> str:
+    """将一跳三元组列表转为 LLM 易理解的文本描述，包含 item_name 以区分跨商品同名实体。"""
+    if not triples:
+        return ""
+    lines = ["[知识图谱实体关系（一跳）]"]
+    # 收集涉及的商品名，超过一个时显式展示 item_name 消歧
+    all_items: Set[str] = set()
+    for t in triples:
+        all_items.add(t.get("source_item", ""))
+        all_items.add(t.get("target_item", ""))
+    multi_item = len(all_items) > 1
 
-    RRF 节点期望的输入格式与 Milvus hybrid_search 返回一致：
-    [{"id": chunk_id, "entity": {"chunk_id": ..., "content": ..., ...}}, ...]
-
-    :param chunks: Milvus 反查返回的切片列表
-    :param entity_relations: 实体关系列表（传给 answer_output 用，此处仅透传）
-    :return: RRF 兼容的切片列表
-    """
-    kg_chunks = []
-    for chunk in chunks:
-        chunk_id = chunk.get("chunk_id")
-        kg_chunks.append({
-            "id": chunk_id,
-            "entity": {
-                "chunk_id": chunk_id,
-                "item_name": chunk.get("item_name", ""),
-                "content": chunk.get("content", ""),
-                "title": chunk.get("title", ""),
-                "parent_title": chunk.get("parent_title", ""),
-                "part": chunk.get("part", ""),
-                "file_title": chunk.get("file_title", ""),
-            },
-        })
-    return kg_chunks
+    for i, t in enumerate(triples, 1):
+        src = t["source"]
+        rel = t["relation"]
+        dst = t["target"]
+        if multi_item:
+            si = t.get("source_item", "")
+            ti = t.get("target_item", "")
+            lines.append(f"{i}. \"{src}\"@{si} --[{rel}]--> \"{dst}\"@{ti}")
+        else:
+            lines.append(f"{i}. \"{src}\" --[{rel}]--> \"{dst}\"")
+    return "\n".join(lines)
 
 
 @node_log("node_search_kg")
@@ -513,26 +665,24 @@ def node_search_kg(state: QueryGraphState) -> dict:
     # Step 3: Milvus 实体名向量对齐 → 映射到图谱中的标准实体名
     aligned_entities = step_3_align_entities_with_milvus(raw_entities, item_names)
 
-    # Step 4: Neo4j 图搜索 → (entity_name, item_name) 对直接匹配 CONTAINS + 1-hop
-    chunk_ids, entity_relations = step_4_neo4j_graph_search(aligned_entities, item_names)
-
-    # Step 5: Milvus 反查切片内容
-    chunks = step_5_query_chunks_from_milvus(chunk_ids)
-
-    # Step 6: 格式化为 RRF 兼容
-    kg_chunks = step_6_format_for_rrf(chunks, entity_relations)
+    # Step 4: Neo4j 图搜索（种子定位 → 一跳扩展 → Chunk 打分 → Milvus 回填 → 三元组文本）
+    kg_chunks, entity_relations, kg_triple_text = step_4_neo4j_graph_search(
+        aligned_entities, item_names
+    )
 
     # 任务结束
     add_done_task(state["session_id"], sys._getframe().f_code.co_name, state.get("is_stream"))
 
     logger.info(
         f"KG检索完成: 输出 {len(kg_chunks)} 个切片（RRF融合用）, "
-        f"{len(entity_relations)} 条实体关系（answer_output用）"
+        f"{len(entity_relations)} 条实体关系（answer_output用）, "
+        f"三元组文本 {len(kg_triple_text)} 字符"
     )
 
     return {
         "kg_chunks": kg_chunks,
         "kg_relations": entity_relations,
+        "kg_triple_text": kg_triple_text,
     }
 
 

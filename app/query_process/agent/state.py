@@ -14,6 +14,7 @@ class QueryGraphState(TypedDict):
     hyde_embedding_chunks: list  # HyDE 检索回来的切片
     kg_chunks: list  # KG 知识图谱检索回来的切片（参与 RRF 融合）
     kg_relations: list  # KG 检索到的实体关系列表 [{source, relation, target}]（供 answer_output 增强用）
+    kg_triple_text: str  # KG 检索到的一跳三元组文本描述（供 answer_output 拼装 prompt）
     web_search_docs: list  # 网络搜索回来的文档
 
     # 排序过程中的数据
@@ -42,6 +43,7 @@ query_graph_default_state: QueryGraphState = {
     "hyde_embedding_chunks": [],
     "kg_chunks": [],
     "kg_relations": [],
+    "kg_triple_text": "",
     "web_search_docs": [],
     "rrf_chunks": [],
     "reranked_docs": [],
