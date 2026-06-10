@@ -90,16 +90,17 @@ def step_2_data_validates(state):
     reranked_docs = state.get("reranked_docs", [])
     item_names = state.get("item_names", [])
     rewritten_query = state.get("rewritten_query") or state.get("original_query")
+    kg_triple_text = state.get("kg_triple_text", "")
 
     # reranked_docs || rewritten_query 为空无法继续
     if not reranked_docs or len(reranked_docs) == 0 or not  rewritten_query:
         logger.error(f"reranked_docs或者rewritten_query为空,无法使用模型进行答案匹配!")
         raise ValueError("reranked_docs或者rewritten_query为空,无法使用模型进行答案匹配!")
 
-    return history, reranked_docs, item_names, rewritten_query
+    return history, reranked_docs, item_names, rewritten_query, kg_triple_text
 
 @step_log("step_3_make_prompt")
-def step_3_make_prompt(reranked_docs, rewritten_query, item_names, history):
+def step_3_make_prompt(reranked_docs, rewritten_query, item_names, history, kg_triple_text=""):
     """
     组装提示词
         【参考内容】
@@ -150,9 +151,13 @@ def step_3_make_prompt(reranked_docs, rewritten_query, item_names, history):
     # 本次关联主体: a, b, c, d
     item_name_str ="本次关联主体:" + ",".join(item_names) if item_names and len(item_names) > 0 else '没有关联主体'
 
+    # KG 三元组文本（来自 node_search_kg step_4e 的 _format_triple_text）
+    kg_relations_str = kg_triple_text if kg_triple_text else "无"
+
     # 加载提示词
-    prompt = load_prompt("answer_out",context = context_chunk_str,
-                history = history_text ,item_names = item_name_str,question = rewritten_query)
+    prompt = load_prompt("answer_out", context=context_chunk_str,
+                history=history_text, item_names=item_name_str,
+                question=rewritten_query, kg_relations=kg_relations_str)
     return prompt
 
 @step_log("step_4_call_lm_final_answer")
@@ -253,9 +258,10 @@ def node_answer_output(state):
     has_answer = step_1_validate_answer(state)
     if not has_answer:
         # 3. 如果没有,获取参数和校验
-        history, reranked_docs, item_names, rewritten_query = step_2_data_validates(state)
+        history, reranked_docs, item_names, rewritten_query, kg_triple_text = step_2_data_validates(state)
         # 4. 组装返回的提示词
-        prompt = step_3_make_prompt(reranked_docs, rewritten_query, item_names, history)
+        prompt = step_3_make_prompt(reranked_docs, rewritten_query, item_names, history, kg_triple_text)
+        state["prompt"] = prompt
         # 5. 调用模型生成润色结果
         step_4_call_lm_final_answer(state,prompt)
         # 6. 获取chunks对应的图片链接地址
@@ -351,7 +357,9 @@ if __name__ == "__main__":
         "reranked_docs": mock_reranked_docs,
         "is_stream": False,  # 测试非流式
         # "is_stream": True, # 若要测试流式，需确保 SSE 环境或 mock 相关函数
-        "answer": None  # 初始无答案
+        "answer": None,  # 初始无答案
+        # 模拟 KG 三元组文本（来自 node_search_kg step_4e）
+        "kg_triple_text": "[知识图谱实体关系（一跳）]\n1. \"漏电保护装置\" --[依赖]--> \"电源模块\"\n2. \"电源模块\" --[包含]--> \"电池\"",
     }
 
     try:
