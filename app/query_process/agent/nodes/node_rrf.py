@@ -112,21 +112,25 @@ if __name__ == "__main__":
     try:
         from app.query_process.agent.nodes.node_search_embedding import node_search_embedding
         from app.query_process.agent.nodes.node_search_embedding_hyde import node_search_embedding_hyde
+        from app.query_process.agent.nodes.node_search_kg import node_search_kg
 
         emb_res = node_search_embedding(mock_state)
         hyde_res = node_search_embedding_hyde(mock_state)
+        kg_res = node_search_kg(mock_state)
         mock_state['embedding_chunks'] = emb_res.get("embedding_chunks") or []
         mock_state['hyde_embedding_chunks'] = hyde_res.get("hyde_embedding_chunks") or []
+        mock_state['kg_chunks'] = kg_res.get("kg_chunks") or []
 
         result = node_rrf(mock_state)
         rrf_chunks = result.get("rrf_chunks", [])
 
         emb_cnt = len(mock_state.get("embedding_chunks") or [])
         hyde_cnt = len(mock_state.get("hyde_embedding_chunks") or [])
+        kg_cnt = len(mock_state.get("kg_chunks") or [])
 
         print("\n" + "=" * 50)
         print(">>> 测试结果摘要:")
-        print(f"输入数量: Embedding={emb_cnt}, HyDE={hyde_cnt}")
+        print(f"输入数量: Embedding={emb_cnt}, HyDE={hyde_cnt}, KG={kg_cnt}")
         print(f"输出数量: {len(rrf_chunks)}")
         print("-" * 30)
 
