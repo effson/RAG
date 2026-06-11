@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-掌柜智库 ("Shopkeeper Knowledge Base") — a Chinese-language RAG system for product manuals (PDF/Markdown). It has two independent pipelines, each built as a **LangGraph** state graph fronted by its own **FastAPI** server:
+基石智库 — a Chinese-language RAG system for product manuals (PDF/Markdown). It has two independent pipelines, each built as a **LangGraph** state graph fronted by its own **FastAPI** server:
 
 - **import_process** — ingest a document → parse → split → embed → store in Milvus + Neo4j knowledge graph.
 - **query_process** — answer a user question via multi-route retrieval → fusion → rerank → LLM generation.
