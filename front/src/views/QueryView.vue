@@ -17,7 +17,7 @@
           <div class="avatar bot-avatar"><BotAvatar /></div>
           <div class="msg-content">
             <div class="bubble">
-              你好，我是基石智库知识库客服。你可以直接提问，我会在"阶段进度"里展示处理过程。
+              你好，我是基石智库知识库助手。你可以直接提问，我会在"阶段进度"里展示处理过程。
             </div>
             <div class="meta">提示：可以问"如何使用万用表测量电压？"</div>
           </div>
