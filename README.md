@@ -93,7 +93,7 @@ uv run python app/tool/download_reranker.py    # BGE 重排序模型
 
 ### 4. 配置环境变量
 
-在项目根目录创建 `.env` 文件（参考下方配置说明）。
+在项目根目录创建 `.env` 文件（参考本项目配置）。
 
 ### 5. 启动服务
 
@@ -116,54 +116,6 @@ uv run python -m app.query_process.api.server     # → http://0.0.0.0:8001
 cd front && npm install && npm run dev
 ```
 
-## 环境变量配置 (.env)
-
-```bash
-# ── LLM (DashScope / OpenAI 兼容) ──
-OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
-OPENAI_API_KEY=your_api_key_here
-LLM_DEFAULT_MODEL=qwen-flash
-LLM_DEFAULT_TEMPERATURE=0.1
-VL_MODEL=qwen3-vl-flash
-
-# ── BGE-M3 嵌入模型 ──
-BGE_M3_PATH=D:/ai_models/bge-m3
-BGE_DEVICE=cuda:0
-BGE_FP16=1
-
-# ── BGE 重排序模型 ──
-BGE_RERANKER_LARGE=D:/ai_models/bge-reranker-large
-BGE_RERANKER_DEVICE=cuda:0
-BGE_RERANKER_FP16=1
-
-# ── Milvus ──
-MILVUS_URL=http://localhost:19530
-CHUNKS_COLLECTION=rag_chunks
-ITEM_NAME_COLLECTION=rag_item_names
-
-# ── Neo4j ──
-NEO4J_URI=bolt://localhost:7687
-NEO4J_USERNAME=neo4j
-NEO4J_PASSWORD=your_password
-NEO4J_DATABASE=neo4j
-
-# ── MongoDB ──
-MONGO_URL=mongodb://localhost:27017
-MONGO_DB_NAME=rag_db
-
-# ── MinIO ──
-MINIO_ENDPOINT=localhost:9000
-MINIO_ACCESS_KEY=your_access_key
-MINIO_SECRET_KEY=your_secret_key
-MINIO_BUCKET_NAME=rag-base-files
-
-# ── MinerU PDF 解析 ──
-MINERU_API_URL=http://localhost:8888
-
-# ── DashScope WebSearch MCP ──
-MCP_DASHSCOPE_BASE_URL=https://dashscope.aliyuncs.com
-ENTITY_NAME_COLLECTION=rag_entity_names
-```
 
 ## 项目结构
 
